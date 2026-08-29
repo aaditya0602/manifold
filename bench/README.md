@@ -352,7 +352,9 @@ All of this runs **inside WSL2 Ubuntu**, not on the Windows host directly
 
    ```bash
    sudo apt-get update
-   sudo apt-get install -y nginx-core util-linux gettext-base curl python3
+   sudo apt-get install -y build-essential nginx-core util-linux gettext-base curl python3
+   # build-essential supplies make (the Makefile) and gcc, which `make test-race`
+   # needs: the Go race detector requires cgo, and cgo requires a C compiler.
 
    # Go: install from go.dev, NOT `apt install golang-go`. Ubuntu 24.04 LTS
    # ships Go 1.22, which is below the 1.24 that go.mod requires, and the
