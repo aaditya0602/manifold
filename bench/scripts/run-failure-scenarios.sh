@@ -87,10 +87,16 @@ PYEOF
   log "wrote ${path}"
 }
 
+# Callers use bg_pid="$(start_background_load ...)", so the backgrounded k6
+# MUST have its stdout redirected. A command substitution returns when every
+# writer to its pipe closes it, not when the function returns, and a
+# backgrounded command inherits stdout. Without the redirect this both blocks
+# for the whole load duration and interleaves k6 banner output into the
+# captured "pid". Same defect class as start_cpu_sampler in lib.sh.
 start_background_load() {
   local out_json="$1" duration="$2"
   TARGET="manifold" STRATEGY="round_robin" CONCURRENCY="$BACKGROUND_LOAD_VUS" BACKEND_LATENCY="scenario" RUN_INDEX="1" \
-    run_k6 "http://127.0.0.1:8080" "constant-vus" "$BACKGROUND_LOAD_VUS" 0 "$duration" "/" "$out_json" &
+    run_k6 "http://127.0.0.1:8080" "constant-vus" "$BACKGROUND_LOAD_VUS" 0 "$duration" "/" "$out_json" >/dev/null 2>&1 &
   echo $!
 }
 
