@@ -1,0 +1,20 @@
+# build output
+/bin/
+/manifold
+/manifold.exe
+/bench/backend/backend
+/bench/backend/backend.exe
+
+# test / profiling
+*.test
+*.out
+*.prof
+coverage.*
+
+# OneDrive / OS noise
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# local scratch (benchmark raw output is committed on purpose; scratch is not)
+/bench/results/scratch/

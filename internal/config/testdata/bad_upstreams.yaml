@@ -1,0 +1,15 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: "tcp://127.0.0.1:9001"
+      - url: "http://127.0.0.1:9002/api"
+      - url: "http:///nohost"
+      - url: "http://127.0.0.1:9003?a=b"
+      - url: "http://127.0.0.1:9004#frag"
+      - url: "http://127.0.0.1:9005"
+      - url: "http://127.0.0.1:9005"
+      - url: "http://127.0.0.1:9006"
+        weight: -2
+routes:
+  - pool: api

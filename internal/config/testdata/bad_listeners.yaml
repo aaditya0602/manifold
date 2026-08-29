@@ -1,0 +1,8 @@
+listen: "8080"
+admin: "not-an-address"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+routes:
+  - pool: api

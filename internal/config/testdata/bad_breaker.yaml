@@ -1,0 +1,12 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+    breaker:
+      enabled: true
+      failure_threshold: 0
+      open_for: 0s
+      half_open_probes: 0
+routes:
+  - pool: api

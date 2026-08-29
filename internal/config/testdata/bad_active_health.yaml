@@ -1,0 +1,18 @@
+# Zeros are written explicitly: presence-aware defaulting keeps them, so these
+# rules are reachable by the mistake an operator actually makes.
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+    health:
+      active:
+        enabled: true
+        path: healthz
+        interval: 0s
+        timeout: 0s
+        expect_status: [200, 99, 600]
+        healthy_threshold: 0
+        unhealthy_threshold: 0
+routes:
+  - pool: api

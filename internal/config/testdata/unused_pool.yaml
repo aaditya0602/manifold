@@ -1,0 +1,10 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+  - name: orphan
+    upstreams:
+      - url: http://127.0.0.1:9002
+routes:
+  - pool: api

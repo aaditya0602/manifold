@@ -1,0 +1,8 @@
+listen: ":8080"
+pools:
+  - name: api
+    strategy: consistent_hash
+    upstreams:
+      - url: http://127.0.0.1:9001
+routes:
+  - pool: api

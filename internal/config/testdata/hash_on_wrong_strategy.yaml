@@ -1,0 +1,9 @@
+listen: ":8080"
+pools:
+  - name: api
+    strategy: round_robin
+    hash_on: client_ip
+    upstreams:
+      - url: http://127.0.0.1:9001
+routes:
+  - pool: api

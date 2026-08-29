@@ -1,0 +1,10 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+    limits:
+      max_in_flight: -1
+      queue_timeout: -5s
+routes:
+  - pool: api

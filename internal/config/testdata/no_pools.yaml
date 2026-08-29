@@ -1,0 +1,4 @@
+listen: ":8080"
+pools: []
+routes:
+  - pool: api

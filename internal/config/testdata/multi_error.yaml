@@ -1,0 +1,15 @@
+# Several unrelated mistakes at once: Validate must report all of them.
+listen: "8080"
+pools:
+  - name: api
+    strategy: bogus
+    upstreams:
+      - url: "tcp://127.0.0.1:9001"
+  - name: orphan
+    upstreams:
+      - url: "http://127.0.0.1:9002"
+routes:
+  - match:
+      path_prefix: "nope"
+      methods: [get]
+    pool: missing

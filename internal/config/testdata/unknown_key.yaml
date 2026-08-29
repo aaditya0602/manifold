@@ -1,0 +1,9 @@
+listen: ":8080"
+# "lisen" is a typo; without KnownFields(true) it would be silently dropped.
+lisen: ":9999"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+routes:
+  - pool: api

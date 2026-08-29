@@ -1,0 +1,25 @@
+# Every value here is a zero or a false written on purpose. None of it may be
+# mistaken for an omitted key.
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+    health:
+      active:
+        enabled: false
+      passive:
+        enabled: false
+    breaker:
+      enabled: false
+    limits:
+      # 0 = unlimited, not "apply the default of 1024".
+      max_in_flight: 0
+    retry:
+      idempotent_only: false
+    transport:
+      # 0 = unlimited idle connections, http.Transport semantics.
+      max_idle_conns: 0
+      disable_compression: false
+routes:
+  - pool: api

@@ -1,0 +1,10 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+    retry:
+      max_attempts: 9
+      per_try_timeout: -1s
+routes:
+  - pool: api

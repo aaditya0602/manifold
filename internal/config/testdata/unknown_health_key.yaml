@@ -1,0 +1,12 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+    health:
+      active:
+        # "intervall" is a typo three levels inside a slice element: it is only
+        # caught if strictness survives the seeding unmarshalers.
+        intervall: 2s
+routes:
+  - pool: api

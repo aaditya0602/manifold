@@ -1,0 +1,19 @@
+listen: ":8080"
+pools:
+  - name: api
+    strategy: consistent_hash
+    hash_on: "header:"
+    upstreams:
+      - url: http://127.0.0.1:9001
+  - name: web
+    strategy: consistent_hash
+    hash_on: "query:id"
+    upstreams:
+      - url: http://127.0.0.1:9002
+routes:
+  - match:
+      path_prefix: /a
+    pool: api
+  - match:
+      path_prefix: /b
+    pool: web

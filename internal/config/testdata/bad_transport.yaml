@@ -1,0 +1,14 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+    transport:
+      max_idle_conns: -1
+      max_idle_conns_per_host: -2
+      max_conns_per_host: -3
+      idle_conn_timeout: -1s
+      dial_timeout: -2s
+      response_header_timeout: -3s
+routes:
+  - pool: api

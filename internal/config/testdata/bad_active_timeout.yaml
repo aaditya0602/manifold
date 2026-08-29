@@ -1,0 +1,12 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+    health:
+      active:
+        enabled: true
+        interval: 1s
+        timeout: 2s
+routes:
+  - pool: api

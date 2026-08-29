@@ -1,0 +1,10 @@
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+routes:
+  - pool: api
+  - match:
+      path_prefix: /other
+    pool: nope
