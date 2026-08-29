@@ -218,7 +218,7 @@ development:
 
 | Tool  | Constraint |
 |---|---|
-| Go | matches `go.mod` (`go 1.27.0`) |
+| Go | matches `go.mod` (`go 1.24` minimum; 1.27 used in development) |
 | k6 | any recent release supporting `constant-vus` / `constant-arrival-rate` executors and `summaryTrendStats` (v0.33+) |
 | nginx | any release with OSS `keepalive`/`proxy_next_upstream_tries`/`hash ... consistent` support (1.15.1+); `nginx -V` output is captured in `meta.json` |
 

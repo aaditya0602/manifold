@@ -16,6 +16,9 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: go test ./... -race -count=1
-      - uses: golangci/golangci-lint-action@v6
+      # v8 installs golangci-lint v2, which is what .golangci.yml targets.
+      # The v6 action installs a v1 build compiled against an older Go, and it
+      # refuses any go.mod whose language version is newer than its own.
+      - uses: golangci/golangci-lint-action@v8
         with:
           version: latest

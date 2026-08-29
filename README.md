@@ -48,7 +48,7 @@ X-Manifold-Upstream: http://127.0.0.1:9002
 
 ## Quickstart
 
-Requires Go 1.27.
+Requires Go 1.24 or newer.
 
 ```bash
 make build
