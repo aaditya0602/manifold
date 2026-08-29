@@ -365,12 +365,17 @@ All of this runs **inside WSL2 Ubuntu**, not on the Windows host directly
    # runs its own nginx on :8080 with bench/nginx/nginx.conf. Stop it so it is
    # not consuming cores during a measured run.
    sudo systemctl disable --now nginx 2>/dev/null || true
-   # k6 (Ubuntu apt repo):
-   sudo gpg -k
-   sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
-     --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-   echo 'deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main' \
-     | sudo tee /etc/apt/sources.list.d/k6.list
+   # k6 (Ubuntu apt repo). Fetch the signing key over HTTPS and dearmor it.
+   #
+   # Do NOT use `gpg --recv-keys` against a keyserver here, which is what k6's
+   # older docs show. Two separate things go wrong. gpg 2.4 writes a *keybox*
+   # rather than a keyring, and apt rejects it outright with "the file has an
+   # unsupported filetype". And the key ID those docs name has since been
+   # rotated, so apt still fails with NO_PUBKEY C780D0BDB1A69C86 even once the
+   # format is fixed. `--dearmor` writes the format apt wants, and pulling from
+   # dl.k6.io always gets whatever the current key is.
+   curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+   echo 'deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main' | sudo tee /etc/apt/sources.list.d/k6.list
    sudo apt-get update && sudo apt-get install -y k6
    ```
 
