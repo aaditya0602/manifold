@@ -563,6 +563,15 @@ CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 # Usage: start_cpu_sampler <pid> <outfile> [interval_seconds]
 # Background loop appending "epoch_ms utime stime rss_kb" lines. Echoes the
 # sampler's own PID so it can be stopped with stop_cpu_sampler.
+#
+# The background subshell MUST have its stdout redirected. Callers invoke this
+# as sampler_pid="$(start_cpu_sampler ...)", and a command substitution does not
+# return when the function returns -- it returns when every writer to the pipe
+# closes it. A backgrounded subshell inherits stdout, so without the redirect it
+# holds that pipe open for its entire life and "$(...)" blocks forever, hanging
+# the whole run after the warmup pass. It only bites targets that have an LB
+# process to sample, which is why `direct` cells completed and `manifold` cells
+# did not.
 start_cpu_sampler() {
   local pid="$1" outfile="$2" interval="${3:-0.5}"
   : > "$outfile"
@@ -581,7 +590,7 @@ start_cpu_sampler() {
       fi
       sleep "$interval"
     done
-  ) &
+  ) >/dev/null 2>&1 &
   echo $!
 }
 
@@ -678,7 +687,7 @@ start_probe_loop() {
       echo "${now} ${code} ${ttime}" >> "$outfile"
       sleep "$interval"
     done
-  ) &
+  ) >/dev/null 2>&1 &
   echo $!
 }
 
