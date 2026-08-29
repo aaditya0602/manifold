@@ -352,7 +352,19 @@ All of this runs **inside WSL2 Ubuntu**, not on the Windows host directly
 
    ```bash
    sudo apt-get update
-   sudo apt-get install -y nginx-core util-linux gettext-base curl python3 golang-go
+   sudo apt-get install -y nginx-core util-linux gettext-base curl python3
+
+   # Go: install from go.dev, NOT `apt install golang-go`. Ubuntu 24.04 LTS
+   # ships Go 1.22, which is below the 1.24 that go.mod requires, and the
+   # build will fail with an unhelpful version error.
+   curl -LO https://go.dev/dl/go1.27.0.linux-amd64.tar.gz
+   sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.27.0.linux-amd64.tar.gz
+   echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && . ~/.bashrc
+
+   # The system nginx service binds :80 and is not used by the harness, which
+   # runs its own nginx on :8080 with bench/nginx/nginx.conf. Stop it so it is
+   # not consuming cores during a measured run.
+   sudo systemctl disable --now nginx 2>/dev/null || true
    # k6 (Ubuntu apt repo):
    sudo gpg -k
    sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
