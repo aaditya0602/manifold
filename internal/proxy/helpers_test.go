@@ -105,7 +105,7 @@ func newBackend(t *testing.T, h http.HandlerFunc) *backend {
 		}
 		_, _ = w.Write([]byte("ok"))
 	}))
-	t.Cleanup(b.Server.Close)
+	t.Cleanup(b.Close)
 	return b
 }
 
