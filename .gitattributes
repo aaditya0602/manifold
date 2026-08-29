@@ -1,0 +1,17 @@
+# Everything in this repo is consumed on Linux (CI, WSL2 benchmarking, Docker),
+# so line endings are LF in the repository and in the working tree. A shell
+# script or Makefile checked out with CRLF fails on Linux with an opaque
+# "\r: command not found", which is a miserable thing to debug.
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.js   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+Makefile text eol=lf
+
+*.png binary
+*.jpg binary
