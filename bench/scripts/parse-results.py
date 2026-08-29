@@ -58,7 +58,10 @@ def load_cell_files(results_dir: Path) -> list[dict]:
     for f in sorted(results_dir.glob("*.json")):
         m = CELL_FILE_RE.match(f.name)
         if not m:
-            if f.name != "meta.json":
+            # meta.json and drift-check.json are read separately; *.warmup.json
+            # are the deliberately discarded warmup passes. None of them are
+            # stray files, so do not report them as unexpected.
+            if f.name not in ("meta.json", "drift-check.json") and not f.name.endswith(".warmup.json"):
                 skipped.append(f.name)
             continue
         try:

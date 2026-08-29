@@ -141,7 +141,14 @@ export function handleSummary(data) {
     strategy: __ENV.STRATEGY || null,
     concurrency: __ENV.CONCURRENCY ? parseInt(__ENV.CONCURRENCY, 10) : null,
     backend_latency: __ENV.BACKEND_LATENCY || null,
-    run: __ENV.RUN_INDEX ? parseInt(__ENV.RUN_INDEX, 10) : null,
+    // RUN_INDEX is a run number for measured runs but the literal string
+    // "warmup" for discarded warmup passes. parseInt("warmup") is NaN, which
+    // then printed as run=NaN and serialised as null -- so keep a non-numeric
+    // value as-is. Warmup lines now read run=warmup, which is what you want
+    // when scanning console output for the runs that actually counted.
+    run: Number.isNaN(parseInt(__ENV.RUN_INDEX, 10))
+      ? (__ENV.RUN_INDEX || null)
+      : parseInt(__ENV.RUN_INDEX, 10),
 
     // what this k6 invocation actually did
     scenario: SCENARIO_NAME,
