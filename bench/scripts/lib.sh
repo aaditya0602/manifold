@@ -329,19 +329,40 @@ stop_pid() {
 }
 
 # Usage: wait_for_tcp <host> <port> <timeout_seconds>
+# Probe from a separate bash process, not a subshell of this one. A subshell
+# inherits `set -e`, and a refused /dev/tcp connect there could take the whole
+# run down on the very first probe -- before the retry loop or the die message
+# ran. That is why a service failing to start appeared as a silent exit 1 with
+# no output whatsoever.
 wait_for_tcp() {
   local host="$1" port="$2" timeout="${3:-15}"
-  local waited=0
-  while ! (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; do
-    exec 3>&- 2>/dev/null || true
+  local deadline=$(( SECONDS + timeout ))
+  while (( SECONDS < deadline )); do
+    if bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+      return 0
+    fi
     sleep 0.2
-    waited=$(( waited + 1 ))
-    if (( waited * 2 >= timeout * 10 )); then
-      return 1
+  done
+  return 1
+}
+
+# Usage: lb_failure_report <name> <pid> <logfile>...
+# Say why a load balancer never came up, rather than dying with a bare path and
+# leaving the operator to go hunting.
+lb_failure_report() {
+  local name="$1" pid="$2"; shift 2
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    warn "${name} (pid ${pid}) is alive but never accepted connections."
+  else
+    warn "${name} exited before it could accept connections."
+  fi
+  local f
+  for f in "$@"; do
+    if [[ -s "$f" ]]; then
+      warn "--- tail of ${f} ---"
+      tail -n 15 "$f" >&2 || true
     fi
   done
-  exec 3>&- 2>/dev/null || true
-  return 0
 }
 
 # Usage: wait_for_http_ok <url> <timeout_seconds>
@@ -479,9 +500,11 @@ start_manifold() {
     "$MANIFOLD_BIN" -config "$cfg")"
 
   if ! wait_for_http_ok "http://127.0.0.1:9090/healthz" 15; then
+    lb_failure_report "manifold" "$MANIFOLD_PID" "${resultsdir}/manifold.log"
     die "manifold (strategy=${strategy}) did not become healthy on :9090/healthz within 15s (see ${resultsdir}/manifold.log)"
   fi
   if ! wait_for_tcp 127.0.0.1 8080 10; then
+    lb_failure_report "manifold" "$MANIFOLD_PID" "${resultsdir}/manifold.log"
     die "manifold data listener :8080 did not come up (see ${resultsdir}/manifold.log)"
   fi
   log "manifold up (strategy=${strategy}, pid=${MANIFOLD_PID}, cores=${CORES_LB})"
@@ -539,12 +562,18 @@ start_nginx() {
   # inherit its affinity mask unless nginx's own `worker_cpu_affinity` is
   # set, which we deliberately leave unset so worker_processes governs
   # parallelism the same way manifold's GOMAXPROCS-driven scheduler does).
-  taskset -c "$CORES_LB" nginx -c "$conf" -g "daemon off; pid ${pidfile};" \
+  # Only "daemon off" belongs in -g. The rendered config already carries a
+  # `pid` directive, and nginx refuses a duplicate with
+  #   [emerg] "pid" directive is duplicate
+  # which `nginx -t` does NOT catch, because -t runs without these -g
+  # globals. Config test clean, startup always broken.
+  taskset -c "$CORES_LB" nginx -c "$conf" -g "daemon off;" \
     >"${resultsdir}/nginx.log" 2>&1 &
   NGINX_PID=$!
 
   if ! wait_for_tcp 127.0.0.1 8080 15; then
-    die "nginx did not come up on :8080 within 15s (see ${resultsdir}/nginx.log and ${resultsdir}/nginx-error.log)"
+    lb_failure_report "nginx" "$NGINX_PID" "${resultsdir}/nginx.log" "${resultsdir}/nginx-error.log"
+    die "nginx did not come up on :8080 within 15s"
   fi
   log "nginx up (pid=${NGINX_PID}, workers=$(core_count_of "$CORES_LB"), cores=${CORES_LB})"
 }
