@@ -71,6 +71,30 @@ check_ac_power
 
 LATENCIES=(${LATENCIES:-1ms 25ms})
 STRATEGIES=(${STRATEGIES:-round_robin least_conn consistent_hash})
+
+# Drop strategies this manifold build does not implement, rather than letting
+# the matrix die partway through. `manifold -check` builds the proxy, not just
+# the config, so an unimplemented strategy fails here in milliseconds instead
+# of after a cell has already started backends and burned a warmup pass.
+# Reported loudly: a silently shrunk matrix would be worse than a crash.
+filter_supported_strategies() {
+  local probe_dir supported=() s
+  probe_dir="$(mktemp -d)"
+  for s in "${STRATEGIES[@]}"; do
+    render_manifold_config "$s" "${probe_dir}/${s}.yaml"
+    if "$MANIFOLD_BIN" -config "${probe_dir}/${s}.yaml" -check >/dev/null 2>"${probe_dir}/${s}.err"; then
+      supported+=("$s")
+    else
+      warn "skipping strategy ${s}: $(tail -n 1 "${probe_dir}/${s}.err")"
+    fi
+  done
+  rm -rf "$probe_dir"
+  if (( ${#supported[@]} == 0 )); then
+    die "no configured strategy is supported by ${MANIFOLD_BIN}"
+  fi
+  STRATEGIES=("${supported[@]}")
+  log "strategies to run: ${STRATEGIES[*]}"
+}
 TARGETS=(${TARGETS:-manifold nginx direct})
 RUNS_PER_CELL="${RUNS_PER_CELL:-3}"
 WARMUP_DURATION="${WARMUP_DURATION:-10s}"
@@ -168,6 +192,8 @@ with open(out_path, "w", encoding="utf-8") as f:
 PYEOF
   log "wrote ${RESULTS_DIR}/meta.json"
 }
+
+filter_supported_strategies
 
 write_meta
 

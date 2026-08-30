@@ -56,18 +56,24 @@ func run() error {
 		return fmt.Errorf("load config %s: %w", *configPath, err)
 	}
 
-	// -check exists so a deploy can validate a config file before restarting
-	// anything. Hot reload (Week 3) will use the same code path.
-	if *checkOnly {
-		fmt.Printf("%s: ok\n", *configPath)
-		return nil
-	}
-
 	px, err := proxy.New(cfg)
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}
 	defer px.Close()
+
+	// -check exists so a deploy, or the benchmark harness, can verify a config
+	// without binding a port. It runs after proxy.New on purpose: parsing and
+	// validating the YAML is only half of what can be wrong with a config. An
+	// unimplemented balancing strategy, an upstream URL that will not resolve,
+	// or a route naming a missing pool all surface when the proxy is built,
+	// not in the schema. A -check that returned before this point would report
+	// "ok" for a config that cannot actually start, which is worse than having
+	// no flag at all.
+	if *checkOnly {
+		fmt.Printf("%s: ok\n", *configPath)
+		return nil
+	}
 
 	dataSrv := &http.Server{
 		Addr:              cfg.Listen,
