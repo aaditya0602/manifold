@@ -1,0 +1,13 @@
+{
+  "original_files": [
+    "/home/aadi0602/manifold/bench/results/20260830T170837Z/manifold-round_robin-c50-l1ms-run1.json"
+  ],
+  "original_median_rps": 11538.522996913412,
+  "recheck_files": [
+    "/home/aadi0602/manifold/bench/results/20260830T170837Z/drift-check-run1.json"
+  ],
+  "recheck_median_rps": 9189.0438148524,
+  "drift_threshold_pct": 10.0,
+  "drift_pct": 20.362044454818907,
+  "thermally_compromised": true
+}

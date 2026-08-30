@@ -162,7 +162,9 @@ throughput decay across a 90-second matrix on this chassis. Roughly half of that
 apparent gap was the laptop throttling, not manifold. The number above comes
 from a run that passed the drift check. Full methodology, including what the
 core pinning does and does not deliver under WSL2, is in
-[`bench/README.md`](bench/README.md).
+[`bench/README.md`](bench/README.md). The raw output behind this table --
+including the thermally compromised run, kept as evidence -- is committed in
+[`bench/results/`](bench/results/README.md).
 
 Targets this project set for itself, reported whether or not they are met:
 

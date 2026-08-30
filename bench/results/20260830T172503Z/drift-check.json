@@ -1,0 +1,13 @@
+{
+  "original_files": [
+    "/home/aadi0602/manifold/bench/results/20260830T172503Z/direct-direct-c50-l1ms-run1.json"
+  ],
+  "original_median_rps": 24764.463214559124,
+  "recheck_files": [
+    "/home/aadi0602/manifold/bench/results/20260830T172503Z/drift-check-run1.json"
+  ],
+  "recheck_median_rps": 23632.50607531448,
+  "drift_threshold_pct": 10.0,
+  "drift_pct": 4.570893095632144,
+  "thermally_compromised": false
+}

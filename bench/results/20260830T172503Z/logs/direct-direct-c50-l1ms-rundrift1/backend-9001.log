@@ -1,0 +1,3 @@
+2026/08/30 13:26:36 backend "backend-9001" starting: addr=127.0.0.1:9001 admin=127.0.0.1:9101 latency=1ms jitter=0s error-rate=0 body-size=0 health-path=/healthz
+2026/08/30 13:26:44 shutdown signal received, draining connections
+2026/08/30 13:26:44 shutdown complete: served=193478
