@@ -33,7 +33,7 @@ X-Manifold-Upstream: http://127.0.0.1:9002
 | Week 1 | YAML config, validation, presence-aware defaults | **done** |
 | Week 1 | Retry on connection failure, idempotent-only | **done** |
 | Week 1 | Graceful drain, bounded | **done** |
-| Week 1 | Benchmark harness + nginx baseline config | **written, not yet run** |
+| Week 1 | Benchmark harness + nginx baseline captured | **done** |
 | Week 2 | Active health probing | not started |
 | Week 2 | Passive ejection on error rate | not started |
 | Week 2 | Least-connections, consistent hash | not started |
@@ -129,16 +129,49 @@ This matters, and overclaiming it is the kind of thing an infra interviewer catc
 
 ## Benchmarks
 
-Not yet run. The harness, the nginx baseline, and the full methodology are in [`bench/README.md`](bench/README.md).
+**Preliminary.** A single run at one point in the matrix, not the full Week 4
+measurement. Directionally sound, but do not quote these as final.
 
-Targets this project sets for itself, to be reported honestly whether or not they are met:
+c=50, 1ms backends, 3 upstreams, 5s measured after a 3s discarded warmup.
+Load generator, balancer, and backends pinned to disjoint core sets.
 
-- Within **20%** of nginx throughput at c=1000 against 1ms backends
-- p99 overhead over direct-to-backend under **2ms** at c=200
-- **Zero** dropped connections across 10 hot config reloads under sustained load
-- Backend ejection within **2×** the health-check interval
+| Target | RPS | p50 | p90 | p99 | p99.9 | LB CPU % | LB RSS |
+|---|---|---|---|---|---|---|---|
+| direct (1 backend) | 24,764 | 1.60 | 3.12 | 7.18 | 11.05 | — | — |
+| nginx 1.28.3 | 19,174 | 1.97 | 4.27 | 11.00 | 17.93 | 82.6% | 18.9 MB |
+| **manifold** | **13,719** | 3.19 | 5.69 | **9.89** | **16.30** | 132.6% | 17.6 MB |
 
-Measurement will be done on a Lenovo Yoga Slim 7 (Intel Core Ultra 7 256V, 8 cores, no SMT) under WSL2, with the load generator, balancer, and backends pinned to disjoint core sets. Two caveats are stated up front rather than buried: `taskset` under WSL2 pins *virtual* CPUs, so physical P-core vs E-core placement is not controllable; and a thin-chassis laptop thermally throttles under a long matrix. The harness interleaves targets within each cell so drift hits every target equally, re-runs its first cell at the end, and flags the whole run as thermally compromised if the result moved. Absolute numbers from this hardware are softer than a dedicated host would give, and the README will say so next to the table.
+Thermal drift across the run: 4.6% (threshold 10%, passed).
+
+**manifold is 28.4% below nginx on throughput, against a target of 20%.** That
+target is not met, and the reason is visible in the CPU column: manifold spends
+132.6% CPU to serve 13.7k rps (103 rps per CPU-percent) where nginx spends 82.6%
+for 19.2k (232 rps per CPU-percent) — roughly 2.2x the CPU per request. Neither
+process saturates its two-core budget, so this is per-request work, not a
+scheduling ceiling. Profiling that is Week 4's job; pprof is already exposed on
+the admin listener.
+
+**manifold's tail latency is better than nginx's** — p99 9.89ms vs 11.00ms, and
+p99.9 16.30ms vs 17.93ms — while its median is worse. Lower throughput with a
+tighter tail is a coherent trade, not noise, and it is worth understanding
+before optimising the median away.
+
+An earlier run of the same cell showed a 49.8% gap. It was thermally
+compromised: the drift check re-runs the first cell at the end and measured 20%
+throughput decay across a 90-second matrix on this chassis. Roughly half of that
+apparent gap was the laptop throttling, not manifold. The number above comes
+from a run that passed the drift check. Full methodology, including what the
+core pinning does and does not deliver under WSL2, is in
+[`bench/README.md`](bench/README.md).
+
+Targets this project set for itself, reported whether or not they are met:
+
+| Target | Status |
+|---|---|
+| Within 20% of nginx throughput at c=1000, 1ms backends | **not met** — 28.4% at c=50; c=1000 not yet measured |
+| p99 overhead over direct under 2ms at c=200 | not yet measured (2.71ms at c=50) |
+| Zero dropped connections across 10 hot reloads | not yet built (Week 3) |
+| Backend ejection within 2x the health-check interval | not yet built (Week 2) |
 
 ## Development
 
