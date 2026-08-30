@@ -134,7 +134,7 @@ scenario_1() {
   sleep 8   # let steady state establish before injecting the failure
 
   local kill_epoch_ms
-  kill_epoch_ms="$(date +%s%3N)"
+  kill_epoch_ms="$(now_ms)"
   log "killing backend on port ${BACKEND_PORTS[0]} (pid ${BACKEND_PIDS[0]})"
   kill -KILL "${BACKEND_PIDS[0]}" 2>/dev/null || true
 
@@ -190,7 +190,7 @@ scenario_2() {
   local bg_pid; bg_pid="$(start_background_load "$bg_json" "30s")"
 
   sleep 3
-  local restart_epoch_ms; restart_epoch_ms="$(date +%s%3N)"
+  local restart_epoch_ms; restart_epoch_ms="$(now_ms)"
   log "restarting backend on port ${port}"
   local new_pid
   new_pid="$(pinned_start "$CORES_BACKENDS" "${logdir}/backend-${port}-restarted.log" \
@@ -245,7 +245,7 @@ scenario_3() {
   local bg_pid; bg_pid="$(start_background_load "$bg_json" "25s")"
 
   sleep 3
-  local reload_epoch_ms_start; reload_epoch_ms_start="$(date +%s%3N)"
+  local reload_epoch_ms_start; reload_epoch_ms_start="$(now_ms)"
   local i
   for i in $(seq 1 10); do
     log "reload ${i}/10"
@@ -255,7 +255,7 @@ scenario_3() {
     fi
     sleep 1.5
   done
-  local reload_epoch_ms_end; reload_epoch_ms_end="$(date +%s%3N)"
+  local reload_epoch_ms_end; reload_epoch_ms_end="$(now_ms)"
 
   wait "$bg_pid" 2>/dev/null || true
   stop_probe_loop "$probe_pid"
@@ -302,7 +302,7 @@ scenario_4() {
   local bg_pid; bg_pid="$(start_background_load "$bg_json" "30s")"
 
   sleep 5
-  local spike_epoch_ms; spike_epoch_ms="$(date +%s%3N)"
+  local spike_epoch_ms; spike_epoch_ms="$(now_ms)"
   log "driving backend ${BACKEND_PORTS[0]} latency to 2000ms via its control port"
   backend_control 0 "latency?d=2000ms" >/dev/null || warn "backend_control latency injection failed -- check bench/backend's actual /_control/latency contract"
 
@@ -379,9 +379,9 @@ scenario_5() {
   # Single request, wall-clock timed, with a hard client-side cap so a
   # genuine hang doesn't wedge the harness itself.
   local start_ms end_ms elapsed_s http_code
-  start_ms="$(date +%s%3N)"
+  start_ms="$(now_ms)"
   http_code="$(curl -s -o /dev/null -m 30 -w '%{http_code}' "http://127.0.0.1:8080/" 2>/dev/null || echo "000")"
-  end_ms="$(date +%s%3N)"
+  end_ms="$(now_ms)"
   elapsed_s="$(awk -v a="$start_ms" -v b="$end_ms" 'BEGIN{printf "%.3f", (b-a)/1000.0}')"
 
   local fail_fast="false"
