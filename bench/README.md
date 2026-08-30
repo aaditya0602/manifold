@@ -545,6 +545,29 @@ sysctl net.core.somaxconn                    # expect >= 65535
 sysctl net.ipv4.tcp_tw_reuse                 # expect 1
 ```
 
+## LB CPU % and RSS: what is actually measured
+
+`LB CPU %` and `LB RSS` are sampled every 0.5s from `/proc` across the load
+balancer's **whole process tree**, not just the process the harness started.
+
+That distinction matters for the comparison to be fair at all. nginx does every
+request in worker processes and its master accumulates no CPU time whatsoever,
+so sampling only the master reported 0% CPU under any load -- which would have
+flattered manifold in the one column where nginx is expected to win. manifold is
+a single process whose threads already roll up into its own accounting, so it
+reads the same either way.
+
+Two honest caveats on these two columns:
+
+- **RSS is summed across the tree**, which double-counts memory shared between
+  nginx workers (copy-on-write pages, the shared zone). nginx's real footprint
+  is therefore somewhat lower than the number shown, and manifold's is exact.
+  Treat the RSS column as an upper bound for nginx and a point value for
+  manifold, not as a like-for-like ratio.
+- **CPU% is normalised to a single core** (100% = one core saturated), matching
+  how `top` and `ps` report it. With `CORES_LB` spanning two cores, 200% is the
+  ceiling.
+
 ## Reading the output
 
 - Raw per-run JSON: `bench/results/<timestamp>/<target>-<strategy>-c<N>-l<latency>-run<i>.json`.

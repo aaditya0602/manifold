@@ -38,6 +38,13 @@ log()  { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
 warn() { printf '[%s] WARN: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
 die()  { printf '[%s] FATAL: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
 
+# Milliseconds since the epoch. Computed from %N rather than %3N: %3N is not
+# honoured everywhere (on the WSL2 box it silently returned full nanoseconds),
+# which made every elapsed-time calculation downstream wrong by a factor of a
+# million -- CPU% collapsed to 0.0 and would have done the same to the Week 3
+# ejection timings. %N is always 9 digits, so this is unambiguous.
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+
 # ---------------------------------------------------------------------------
 # Tool presence checks. Fail loudly and immediately, never silently degrade.
 # ---------------------------------------------------------------------------
@@ -601,21 +608,55 @@ CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 # the whole run after the warmup pass. It only bites targets that have an LB
 # process to sample, which is why `direct` cells completed and `manifold` cells
 # did not.
+# Usage: proc_tree_cpu_rss <root_pid>  ->  "utime stime rss_kb"
+# Sums cumulative CPU jiffies and resident memory across a process and every
+# descendant.
+#
+# This exists because nginx does all request handling in worker processes: its
+# master accumulates no utime/stime at all, so sampling the master alone
+# reported 0% CPU no matter the load, and would have flattered manifold in the
+# headline comparison. manifold is a single process whose threads already roll
+# up into its own stat, so it reads the same either way.
+#
+# RSS is summed across the tree, which double-counts memory shared between
+# nginx workers. Stated in bench/README.md rather than silently corrected.
+proc_tree_cpu_rss() {
+  local root="$1"
+  local -a queue=("$root")
+  local -a seen=()
+  local idx=0 cur kid
+  while (( idx < ${#queue[@]} )); do
+    cur="${queue[idx]}"
+    idx=$(( idx + 1 ))
+    [[ -d "/proc/${cur}" ]] || continue
+    seen+=("$cur")
+    for kid in $(cat /proc/"${cur}"/task/*/children 2>/dev/null); do
+      queue+=("$kid")
+    done
+  done
+  local u=0 s=0 r=0 cu cs cr
+  for cur in "${seen[@]}"; do
+    # Split after the "comm" field, which is parenthesised and may contain
+    # spaces; utime/stime are the 12th and 13th fields after it.
+    read -r cu cs < <(awk '{ n=index($0,") "); split(substr($0,n+2),a," "); print a[12], a[13] }' "/proc/${cur}/stat" 2>/dev/null)
+    cr="$(awk '/^VmRSS:/{print $2}' "/proc/${cur}/status" 2>/dev/null)"
+    [[ -n "$cu" ]] && u=$(( u + cu ))
+    [[ -n "$cs" ]] && s=$(( s + cs ))
+    [[ -n "$cr" ]] && r=$(( r + cr ))
+  done
+  printf '%s %s %s\n' "$u" "$s" "$r"
+}
+
 start_cpu_sampler() {
   local pid="$1" outfile="$2" interval="${3:-0.5}"
   : > "$outfile"
   (
     while kill -0 "$pid" 2>/dev/null; do
-      if [[ -r "/proc/${pid}/stat" && -r "/proc/${pid}/status" ]]; then
-        local now utime stime rss_kb stat_fields
-        now="$(date +%s%3N)"
-        stat_fields="$(awk '{print $14, $15}' "/proc/${pid}/stat" 2>/dev/null)"
-        utime="$(echo "$stat_fields" | awk '{print $1}')"
-        stime="$(echo "$stat_fields" | awk '{print $2}')"
-        rss_kb="$(awk '/^VmRSS:/{print $2}' "/proc/${pid}/status" 2>/dev/null)"
-        if [[ -n "$utime" && -n "$stime" && -n "$rss_kb" ]]; then
-          echo "${now} ${utime} ${stime} ${rss_kb}" >> "$outfile"
-        fi
+      local now agg
+      now="$(now_ms)"
+      agg="$(proc_tree_cpu_rss "$pid")"
+      if [[ -n "$agg" ]]; then
+        echo "${now} ${agg}" >> "$outfile"
       fi
       sleep "$interval"
     done
@@ -710,7 +751,7 @@ start_probe_loop() {
   (
     while true; do
       local now code ttime
-      now="$(date +%s%3N)"
+      now="$(now_ms)"
       read -r code ttime < <(curl -s -o /dev/null -m 3 \
         -w '%{http_code} %{time_total}' "$url" 2>/dev/null || echo "000 0")
       echo "${now} ${code} ${ttime}" >> "$outfile"
