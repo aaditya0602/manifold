@@ -27,6 +27,11 @@ type Backend struct {
 	// origin. Read by least_conn (Week 2) and by tests asserting that the
 	// proxy's Acquire/Release pairing is leak-free.
 	inFlight atomic.Int64
+
+	// avail is the health/ejection state read by Available. It is mutated
+	// only through Pool, which owns the generation counter — see
+	// availability.go.
+	avail availabilityState
 }
 
 // ID is the backend's stable index within its pool. balance.Candidate.ID

@@ -64,8 +64,10 @@ func TestNewRegistry_Rejects(t *testing.T) {
 	})
 
 	t.Run("bad pool fails the whole registry", func(t *testing.T) {
-		bad := poolCfg("broken", "http://127.0.0.1:9002")
-		bad.Strategy = config.StrategyLeastConn
+		// Any pool that cannot be built will do; a URL with no scheme is
+		// the cheapest. (This used to use least_conn, which was
+		// unimplemented and is not any more.)
+		bad := poolCfg("broken", "127.0.0.1:9002")
 
 		cfg := &config.Config{Pools: []config.PoolConfig{
 			poolCfg("api", "http://127.0.0.1:9001"),

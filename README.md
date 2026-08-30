@@ -4,7 +4,7 @@ An L7 HTTP load balancer in Go — path/header routing across upstream pools, wi
 
 An intake manifold splits one flow across many outlets. So does this.
 
-> **Status: Week 1 of 4 — walking skeleton.** The proxy serves real traffic across multiple upstreams with round-robin balancing, retries, and graceful drain. Health checking, circuit breaking, backpressure, observability, and the benchmark results are not built yet. The roadmap below marks exactly what exists and what does not, and this README will not claim otherwise before the code lands.
+> **Status: Week 2 of 4.** The proxy serves real traffic across multiple upstreams with all three balancing strategies, active and passive health checking, automatic ejection and readmission, and Prometheus metrics. Circuit breaking, backpressure, hot reload, and tracing are not built yet. The roadmap below marks exactly what exists and what does not, and this README will not claim otherwise before the code lands.
 
 ---
 
@@ -16,11 +16,14 @@ X-Manifold-Upstream: http://127.0.0.1:9002
 ```
 
 - **L7 routing** — first-match-wins rules over host, path prefix, method, and headers, mapping requests to named upstream pools.
-- **Round-robin balancing**, weighted, on a lock-free pick path.
+- **Three balancing strategies** — weighted round-robin and least-connections on a lock-free pick path, plus consistent hashing with virtual nodes for session affinity.
+- **Active health checking** — out-of-band probes on their own transport, with configurable interval, timeout, and consecutive-success/failure thresholds.
+- **Passive ejection** — a sliding error-rate window over real traffic, so a backend that answers `/healthz` but fails actual requests is still removed. Automatic readmission after a cooldown.
 - **Retry policy** that is narrow on purpose: connection-level failures only, idempotent methods only, only before a byte has reached the client, only when the body is replayable, and never onto a backend already tried.
+- **Prometheus metrics** on the admin listener — request and upstream counters, a latency histogram bucketed for this proxy's actual p50 and p99, live in-flight and availability gauges.
 - **Graceful drain** on SIGINT/SIGTERM with a bounded deadline.
 - **Config validation** that reports every problem at once with YAML paths, rejects unknown keys at any nesting depth, and distinguishes an omitted key from one explicitly set to zero or false.
-- **Separate admin listener** for `/healthz`, `/version`, and pprof — never reachable from the data-plane port.
+- **Separate admin listener** for `/metrics`, `/healthz`, `/version`, and pprof — never reachable from the data-plane port.
 - A **configurable backend** (`bench/backend`) that impersonates slow, flaky, and dead upstreams, with runtime chaos controls on its own port.
 - A **benchmark harness** against nginx and direct-to-backend, with thermal-drift detection and honest methodology.
 
@@ -34,17 +37,31 @@ X-Manifold-Upstream: http://127.0.0.1:9002
 | Week 1 | Retry on connection failure, idempotent-only | **done** |
 | Week 1 | Graceful drain, bounded | **done** |
 | Week 1 | Benchmark harness + nginx baseline captured | **done** |
-| Week 2 | Active health probing | not started |
-| Week 2 | Passive ejection on error rate | not started |
-| Week 2 | Least-connections, consistent hash | not started |
-| Week 2 | Prometheus `/metrics` | not started |
+| Week 2 | Active health probing | **done** |
+| Week 2 | Passive ejection on error rate | **done** |
+| Week 2 | Least-connections, consistent hash | **done** |
+| Week 2 | Prometheus `/metrics` | **done** |
 | Week 3 | Circuit breaker, half-open probing | not started |
 | Week 3 | Bounded in-flight, 503 shedding | not started |
 | Week 3 | Hot config reload, zero dropped connections | not started |
 | Week 3 | OpenTelemetry spans | not started |
 | Week 4 | Benchmark results + methodology | not started |
 
-`least_conn` and `consistent_hash` are accepted by config validation but return a startup error from the strategy factory. That is deliberate: the schema is stable from day one, and the gap is loud rather than silent.
+### Week 2 acceptance gate
+
+The plan's gate was *"a backend killed under load is ejected and re-admitted automatically, proven by test."* `TestGate_BackendKilledUnderLoadIsEjectedAndReadmitted` kills a backend under ~10k rps of concurrent load and measures it. Across five consecutive runs:
+
+| | measured | target |
+|---|---|---|
+| Time to ejection | 38–58 ms | 60 ms (2x the 30 ms probe interval) |
+| Time to readmission | 27–52 ms | 60 ms |
+| Client-visible errors after ejection | **0** | 0 |
+| Client-visible errors *during* detection | **0** | some tolerated |
+| All backends down | 503 in <1 ms | must not hang |
+
+Zero errors during the detection window was not required — retries absorbed every request that hit the dying backend before the prober noticed.
+
+One honest correction to the plan's phrasing: **"ejection within 2x the health-check interval" is an expectation, not a worst-case bound.** The prober randomises each backend's probe phase to avoid a self-inflicted thundering herd, so the first probe after a failure falls uniformly in `[0, interval)`. `unhealthy_threshold x interval` is therefore the mean; the true worst case is that plus one probe round-trip.
 
 ## Quickstart
 
@@ -105,6 +122,16 @@ parse: yaml: unmarshal errors:
 
 **Breaker, health, limits, and retry policy are per-pool, not global.** One misbehaving backend pool must not trip anything for another.
 
+**Ejection expiry is explicit state, never a clock comparison.** `Ejected()` does not check `time.Now()`. If it did, a backend would silently rejoin the available set with nobody bumping the generation counter, and a consistent-hash ring cached against the old generation would keep routing to it. A sweeper calls `Readmit()` instead, which goes through `Pool` and bumps the generation like every other transition.
+
+**A 4xx is not a backend failure.** Passive ejection counts connection errors and 5xx only. Counting 4xx would mean a client spamming 404s could eject healthy backends — a self-inflicted outage with an external trigger.
+
+**The health prober gets its own transport.** Probes on the data-plane pool would evict pooled connections under load, and a saturated data plane would starve the health checks meant to notice it was saturated.
+
+**Probe phases are randomised per backend.** Every backend probing on the same tick is a thundering herd aimed at your own upstreams. The cost is that time-to-ejection becomes a distribution rather than a bound, which the gate results state plainly.
+
+**Metric labels are a closed set.** HTTP method is client-controlled, so it is collapsed to nine known verbs plus `OTHER`; an unbounded label there is a memory-exhaustion vector, not just a cardinality annoyance. Label children are resolved once at startup, never per request — instrumentation costs 36ns and zero allocations per request, asserted by a test.
+
 ## What is standard library, and what is not
 
 This matters, and overclaiming it is the kind of thing an infra interviewer catches in one question.
@@ -116,7 +143,7 @@ This matters, and overclaiming it is the kind of thing an infra interviewer catc
 - **Hop-by-hop header stripping** — `ReverseProxy`, including headers a client names in its own `Connection` header.
 - **Graceful shutdown primitive** — `http.Server.Shutdown`.
 
-**This project implements:** the routing table and match evaluation, the balancing strategies, the retry policy and its safety conditions, the trust model for forwarding headers, per-pool transport construction and backend accounting, config schema/validation/presence-aware defaulting, the drain orchestration across two listeners — and, in the weeks ahead, health checking, ejection, circuit breaking, backpressure, hot reload, and observability.
+**This project implements:** the routing table and match evaluation, the balancing strategies, the retry policy and its safety conditions, the trust model for forwarding headers, per-pool transport construction and backend accounting, config schema/validation/presence-aware defaulting, the drain orchestration across two listeners, active and passive health checking with ejection and readmission, and the Prometheus instrumentation — and, in the weeks ahead, circuit breaking, backpressure, hot reload, and tracing.
 
 ## Limitations
 
@@ -125,6 +152,8 @@ This matters, and overclaiming it is the kind of thing an infra interviewer catc
 - **Retries require a replayable body** — currently only empty-bodied requests. Buffering bodies for replay is out of scope.
 - **No rate limiting, auth, or WAF.**
 - **Route header matching is exact, single-valued** — a route cannot require a repeated header or match on absence.
+- **Consistent hashing on `client_ip` uses the peer address**, not the left-most `X-Forwarded-For` entry, even when `trust_forwarded_for` is on. Reading the header would make session affinity forgeable by any client, so the gap is deliberate and unfixed rather than silently wrong.
+- **Passive ejection needs traffic.** A backend receiving almost no requests is never ejected passively; active probing is what covers that.
 - **`weight: 0` is treated as 1**, not rejected, because a slice element cannot distinguish an omitted weight from an explicit zero without a further mirror type. See the note in `internal/config/defaults.go`.
 
 ## Benchmarks
@@ -173,7 +202,7 @@ Targets this project set for itself, reported whether or not they are met:
 | Within 20% of nginx throughput at c=1000, 1ms backends | **not met** — 28.4% at c=50; c=1000 not yet measured |
 | p99 overhead over direct under 2ms at c=200 | not yet measured (2.71ms at c=50) |
 | Zero dropped connections across 10 hot reloads | not yet built (Week 3) |
-| Backend ejection within 2x the health-check interval | not yet built (Week 2) |
+| Backend ejection within 2x the health-check interval | **met** — 38-58ms against a 60ms target, zero client errors |
 
 ## Development
 

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aaditya0602/manifold/internal/config"
+	"github.com/aaditya0602/manifold/internal/observe"
 	"github.com/aaditya0602/manifold/internal/proxy"
 )
 
@@ -56,7 +57,12 @@ func run() error {
 		return fmt.Errorf("load config %s: %w", *configPath, err)
 	}
 
-	px, err := proxy.New(cfg)
+	// Metrics are constructed before the proxy because proxy.NewWithMetrics
+	// resolves every labelled child metric at build time — that is the whole
+	// point of the split, and it means the registry has to exist first.
+	metrics := observe.New(versionString())
+
+	px, err := proxy.NewWithMetrics(cfg, metrics)
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}
@@ -75,6 +81,22 @@ func run() error {
 		return nil
 	}
 
+	// Signals are trapped before anything is started, so a SIGTERM that
+	// arrives during startup is caught rather than killing the process
+	// outright, and so the context handed to px.Start is already the one that
+	// shutdown will cancel.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Health checking starts before the listeners bind. The ordering is
+	// deliberate: with active checks enabled, every backend starts assumed
+	// healthy, so a proxy that accepted traffic first would spend its first
+	// probe interval forwarding requests to origins it has no evidence about
+	// -- including, after a restart into a partial outage, to origins that are
+	// already down. Starting the probers first gives them a head start on the
+	// first client, and it costs nothing: Start returns immediately.
+	px.Start(ctx)
+
 	dataSrv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           px,
@@ -87,7 +109,7 @@ func run() error {
 
 	adminSrv := &http.Server{
 		Addr:              cfg.Admin,
-		Handler:           adminHandler(),
+		Handler:           adminHandler(metrics),
 		ReadHeaderTimeout: 5 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
@@ -106,9 +128,6 @@ func run() error {
 		"routes", len(cfg.Routes),
 	)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	select {
 	case err := <-errCh:
 		return err
@@ -118,7 +137,22 @@ func run() error {
 		stop()
 	}
 
-	return shutdown(dataSrv, adminSrv, cfg.Server.DrainTimeout.D())
+	drainErr := shutdown(dataSrv, adminSrv, cfg.Server.DrainTimeout.D())
+
+	// Health checking is stopped after the drain, not before it. Requests
+	// still in flight are entitled to a correct candidate set: a backend that
+	// dies mid-drain should still be ejected, and killing the probers first
+	// would freeze availability at whatever it happened to be when SIGTERM
+	// landed. Close also waits for the prober and tracker goroutines to exit,
+	// so the process does not exit while it still has probes on the wire.
+	//
+	// px.Start's context is already cancelled by now (it is ctx, and stop()
+	// above released it), which makes this the wait rather than the signal --
+	// but Close cancels its own derived context too, so this is correct even
+	// when Start was handed an uncancellable one.
+	px.Close()
+
+	return drainErr
 }
 
 func serve(name string, srv *http.Server) error {
@@ -157,9 +191,8 @@ func shutdown(data, admin *http.Server, drainTimeout time.Duration) error {
 	return err
 }
 
-// adminHandler serves the operational endpoints. Prometheus /metrics is added
-// in Week 2; the handler exists now so the port contract is stable.
-func adminHandler() http.Handler {
+// adminHandler serves the operational endpoints.
+func adminHandler(metrics *observe.Metrics) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -171,6 +204,23 @@ func adminHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = fmt.Fprintln(w, versionString())
 	})
+
+	// /metrics is mounted here and nowhere else. The data plane's handler is
+	// the proxy itself, which serves only what the route table names, so there
+	// is no path by which a client of the proxy can reach this. That is a
+	// security property, not a tidiness one: the exposition output enumerates
+	// every pool name and every upstream address in the deployment, which is
+	// an internal network map, and an unauthenticated scrape endpoint on the
+	// data plane is also a cheap way to make the process do real work.
+	//
+	// It is registered on the mux explicitly, for the same reason the pprof
+	// handlers below are: promhttp.Handler() would serve
+	// prometheus.DefaultGatherer, picking up whatever any dependency happened
+	// to register in an init function. metrics.Handler() serves manifold's own
+	// registry and nothing else.
+	if metrics != nil {
+		mux.Handle("GET /metrics", metrics.Handler())
+	}
 
 	// Registered explicitly rather than via the net/http/pprof package's
 	// init-time DefaultServeMux side effect, so profiling endpoints can only

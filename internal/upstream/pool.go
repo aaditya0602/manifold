@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,11 +40,24 @@ type Pool struct {
 	// are per-pool config.
 	transport *http.Transport
 
-	// gen is bumped whenever pool membership changes. Nothing increments it in
-	// Week 1 (Candidates returns every backend), but the stateful strategies
-	// cache derived structures keyed on it, so the plumbing has to exist from
-	// the start: ejection and readmission in Week 2 become a single Add(1).
+	// gen is bumped whenever the available set changes: a probe verdict, a
+	// passive ejection, a readmission. The stateful strategies cache derived
+	// structures keyed on it, and balance.Strategy.Pick documents the hard
+	// obligation that it move on *any* change, including a same-length swap.
+	// Every mutation lives in availability.go so that obligation is enforced
+	// in one place rather than at each call site.
 	gen atomic.Uint64
+
+	// availMu serialises availability transitions so a backend's
+	// read-modify-write and the matching gen bump are one atomic step.
+	// Readers never take it: Candidates reads the state with plain atomic
+	// loads.
+	availMu sync.Mutex
+
+	// hookMu serialises OnAvailabilityChange registration only; hooks itself
+	// is copy-on-write so the notify path is lock-free.
+	hookMu sync.Mutex
+	hooks  atomic.Pointer[[]availabilityHook]
 }
 
 // NewPool builds a Pool from validated config. It returns an error rather than
@@ -88,7 +102,13 @@ func NewPool(cfg config.PoolConfig) (*Pool, error) {
 		if w < 1 {
 			w = 1
 		}
-		backends = append(backends, &Backend{id: i, url: origin, key: key, weight: w})
+		b := &Backend{id: i, url: origin, key: key, weight: w}
+		// Backends start available. An unreachable origin is discovered by the
+		// prober within unhealthy_threshold intervals; starting them all
+		// unhealthy would 503 every request for the first probe interval of
+		// every boot and every config reload.
+		b.avail.activeHealthy.Store(true)
+		backends = append(backends, b)
 	}
 
 	return &Pool{
@@ -136,21 +156,37 @@ func (p *Pool) Strategy() balance.Strategy { return p.strategy }
 // derived state (see balance.Strategy.Pick).
 func (p *Pool) Gen() uint64 { return p.gen.Load() }
 
-// Candidates returns the backends eligible to serve a request right now.
+// Candidates returns the backends eligible to serve a request right now:
+// those an active prober has not marked unhealthy and passive health has not
+// ejected.
 //
-// Week 1 returns every backend: health checking, ejection, and circuit
-// breaking are Week 2, and until they exist "eligible" and "configured" are
-// the same set. The slice is freshly built on each call and handed to a
-// strategy that may retain it, so it must not alias any Pool-owned storage.
+// When nothing is available it returns an empty slice, the strategy reports
+// ok=false, and the proxy answers 503. That is the intended behaviour: fail
+// fast rather than hang or queue against origins we have concrete evidence
+// are broken, and let the client retry or the edge fail over.
+//
+// The considered alternative is Envoy-style panic mode: once the healthy
+// fraction drops below a threshold, ignore health entirely and load balance
+// across all backends on the theory that mass unhealthiness usually means the
+// health checker is wrong, not that every origin is down. It is deliberately
+// not implemented here — it trades a crisp, explainable failure for traffic
+// sent to backends we believe are dead, and manifold has no second signal
+// with which to judge its own checker.
+//
+// The slice is freshly built on each call and handed to a strategy that may
+// retain it, so it must not alias any Pool-owned storage.
 func (p *Pool) Candidates() []balance.Candidate {
-	out := make([]balance.Candidate, len(p.backends))
-	for i, b := range p.backends {
-		out[i] = balance.Candidate{
+	out := make([]balance.Candidate, 0, len(p.backends))
+	for _, b := range p.backends {
+		if !b.Available() {
+			continue
+		}
+		out = append(out, balance.Candidate{
 			ID:       b.id,
 			Key:      b.key,
 			Weight:   b.weight,
 			InFlight: b.InFlight(),
-		}
+		})
 	}
 	return out
 }

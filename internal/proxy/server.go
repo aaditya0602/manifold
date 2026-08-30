@@ -14,9 +14,15 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/aaditya0602/manifold/internal/balance"
 	"github.com/aaditya0602/manifold/internal/config"
+	"github.com/aaditya0602/manifold/internal/health"
+	"github.com/aaditya0602/manifold/internal/observe"
 	"github.com/aaditya0602/manifold/internal/upstream"
 )
 
@@ -53,21 +59,91 @@ func attemptFrom(ctx context.Context) *attemptState {
 
 // Server is the HTTP handler for the data plane.
 //
-// It is immutable after New. A config reload constructs a second Server and
-// swaps it in; nothing here is mutated under traffic, so ServeHTTP takes no
-// locks.
+// Everything ServeHTTP reads is immutable after New. A config reload
+// constructs a second Server and swaps it in; nothing on the request path is
+// mutated under traffic, so ServeHTTP takes no locks.
+//
+// The health checkers are the one piece of mutable state, and they are kept
+// strictly off the request path: Start owns them, Close stops them, and
+// ServeHTTP only ever calls Tracker.Record, which is lock-free. The explicit
+// Start/Close pair -- rather than starting goroutines in New -- exists so that
+// constructing a Server is side-effect free. A `-check` run, a test that only
+// exercises routing, and the second Server built by a future hot reload must
+// all be able to exist without probing anybody's backends.
 type Server struct {
-	reg     *upstream.Registry
-	routes  []route
-	proxies map[string]*httputil.ReverseProxy
+	reg    *upstream.Registry
+	routes []route
+
+	// probers and trackers are parallel to reg.Pools(): one of each per pool,
+	// built in New and owned for the life of the Server.
+	probers  []*health.Prober
+	trackers []*health.Tracker
+
+	// lifeMu guards the Start/Close state machine. It is never taken by
+	// ServeHTTP.
+	lifeMu  sync.Mutex
+	cancel  context.CancelFunc
+	started bool
+	closed  bool
+
+	// pools holds everything ServeHTTP needs for one pool behind a single map
+	// lookup. It replaces what used to be a map to *httputil.ReverseProxy: the
+	// lookup was already on the request path, so folding the pool's
+	// pre-resolved metrics into the same value adds instrumentation for zero
+	// additional lookups.
+	pools map[string]*poolInstr
+
+	// noRoute is resolved once at construction. It is unlabelled, so this is
+	// the whole hot-path value, not a *Vec to be indexed per request.
+	noRoute prometheus.Counter
+}
+
+// poolInstr is the per-pool request-path state: the shared reverse proxy plus
+// every metric child already resolved.
+type poolInstr struct {
+	rp *httputil.ReverseProxy
+	pm *observe.PoolMetrics
+
+	// tracker is this pool's passive health checker. dispatch feeds it one
+	// outcome per attempt. It is never nil: a pool with passive health
+	// disabled still gets a Tracker whose Record returns on a single bool
+	// load, which keeps the attempt loop free of a nil check that would be
+	// taken in exactly the configurations nobody benchmarks.
+	tracker *health.Tracker
+
+	// up is indexed by upstream.Backend.ID, which is the backend's index
+	// within its pool, so selecting an upstream's counters is an array index
+	// and never a label lookup or a map hash.
+	up []*observe.UpstreamMetrics
 }
 
 // New builds a Server from validated config. It fails rather than starting
 // degraded: an unimplemented balancing strategy, an unparseable upstream URL,
 // or a route naming a pool that does not exist are all startup errors.
+//
+// It is the uninstrumented entry point, kept so existing callers and tests do
+// not have to know about metrics. It delegates with a metrics value rather
+// than a nil one — see NewWithMetrics for why.
 func New(cfg *config.Config) (*Server, error) {
+	return NewWithMetrics(cfg, nil)
+}
+
+// NewWithMetrics is New with Prometheus instrumentation attached.
+//
+// A nil m is legal and means "not observed". It is handled by constructing a
+// throwaway Metrics over a private registry that nothing ever scrapes, rather
+// than by storing nil and testing for it per request. That choice is
+// deliberate: a nil test on the request path is a branch on every counter
+// increment in the process, and — worse — it is a branch that is never taken
+// in production and always taken in the benchmark, so it would make the
+// benchmark measure a code path that never runs. Paying one wasted registry
+// per unobserved Server at startup buys a request path with exactly one shape.
+func NewWithMetrics(cfg *config.Config, m *observe.Metrics) (*Server, error) {
 	if cfg == nil {
 		return nil, errors.New("proxy: nil config")
+	}
+	if m == nil {
+		m = observe.New("")
 	}
 	reg, err := upstream.NewRegistry(cfg)
 	if err != nil {
@@ -79,19 +155,92 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 
+	pools := reg.Pools()
 	s := &Server{
-		reg:     reg,
-		routes:  routes,
-		proxies: make(map[string]*httputil.ReverseProxy, len(cfg.Pools)),
+		reg:      reg,
+		routes:   routes,
+		pools:    make(map[string]*poolInstr, len(cfg.Pools)),
+		probers:  make([]*health.Prober, 0, len(pools)),
+		trackers: make([]*health.Tracker, 0, len(pools)),
+		noRoute:  m.NoRoute(),
 	}
-	for _, p := range reg.Pools() {
-		s.proxies[p.Name()] = newReverseProxy(p, cfg.Server.TrustForwardedFor)
+	for _, p := range pools {
+		pm := m.Pool(p.Name())
+
+		// Resolve one UpstreamMetrics per backend, indexed by backend ID.
+		// Backend.ID is the config index within the pool, so the slice is
+		// dense and every ID the balancer can hand back is in range.
+		backends := p.Backends()
+		up := make([]*observe.UpstreamMetrics, len(backends))
+		// byKey is the same set of children indexed the other way. The
+		// availability hook is handed a backend key, not an ID, and it runs
+		// on a prober goroutine at transition frequency -- a handful of times
+		// per outage -- so a map lookup there is free, and building it here
+		// keeps the request path's dense array intact.
+		byKey := make(map[string]*observe.UpstreamMetrics, len(backends))
+		for _, b := range backends {
+			um := pm.Upstream(b.Key())
+			byKey[b.Key()] = um
+			if id := b.ID(); id >= 0 && id < len(up) {
+				up[id] = um
+			}
+		}
+
+		// NewProber returns an error rather than disabling itself, so a pool
+		// whose active health config is unusable fails at startup instead of
+		// running forever with no checking and no sign of it.
+		prober, err := health.NewProber(p)
+		if err != nil {
+			reg.Close()
+			return nil, err
+		}
+		s.probers = append(s.probers, prober)
+
+		tracker := health.NewTracker(p)
+		s.trackers = append(s.trackers, tracker)
+
+		// Subscribed here, in New, and not in Start: a transition can only be
+		// caused by a checker this Server owns, and those cannot run until
+		// Start. Subscribing at construction means there is no window in which
+		// a prober is probing and nobody is watching, and it keeps the
+		// subscription tied to the object's lifetime rather than to a call
+		// that may never happen.
+		p.OnAvailabilityChange(availabilityHook(p.Name(), byKey))
+
+		s.pools[p.Name()] = &poolInstr{
+			rp:      newReverseProxy(p, cfg.Server.TrustForwardedFor),
+			pm:      pm,
+			up:      up,
+			tracker: tracker,
+		}
+		m.RegisterPoolCollector(poolStats{p})
 	}
 	return s, nil
 }
 
-// Close releases the pools' idle connections.
-func (s *Server) Close() { s.reg.Close() }
+// poolStats adapts an upstream.Pool to observe.PoolStater, so that
+// manifold_upstream_inflight and manifold_upstream_available are read from the
+// live backends when Prometheus scrapes instead of being mirrored on the
+// request path.
+//
+// The adapter lives here rather than in observe because observe must not
+// import the data plane, and it lives here rather than in upstream because
+// upstream must not know that Prometheus exists.
+type poolStats struct{ p *upstream.Pool }
+
+func (ps poolStats) Name() string { return ps.p.Name() }
+
+func (ps poolStats) Upstreams(yield func(key string, inflight int64, available bool)) {
+	for _, b := range ps.p.Backends() {
+		yield(b.Key(), b.InFlight(), backendAvailable(b))
+	}
+}
+
+// backendAvailable reports whether a backend is currently eligible to serve.
+// It is read at scrape time by the manifold_upstream_available collector, never
+// on the request path -- the request path gets an already-filtered candidate
+// set from Pool.Candidates.
+func backendAvailable(b *upstream.Backend) bool { return b.Available() }
 
 // newReverseProxy builds the single ReverseProxy shared by every request to
 // one pool.
@@ -189,12 +338,33 @@ func newReverseProxy(p *upstream.Pool, trustForwardedFor bool) *httputil.Reverse
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rt := s.lookup(r)
 	if rt == nil {
+		s.noRoute.Inc()
 		http.Error(w, "no route matched", http.StatusNotFound)
 		return
 	}
 
-	pool := rt.pool
-	rp := s.proxies[pool.Name()]
+	pi := s.pools[rt.pool.Name()]
+	cw := &clientWriter{ResponseWriter: w}
+
+	// Started after routing so an unrouted request pays nothing, and so the
+	// histogram measures the work manifold actually did on behalf of a pool.
+	start := time.Now()
+
+	s.dispatch(cw, r, rt.pool, pi)
+
+	// One observation point for the whole request. dispatch has half a dozen
+	// exits — 503 with no candidate, 503 with no pick, success, terminal
+	// failure, client gone — and threading a metric increment through each of
+	// them is how a status class ends up uncounted on the one path nobody
+	// tested. cw.status is what the client actually saw, and is 0 when the
+	// client vanished before anything was written, which classOf maps to
+	// "other" rather than pretending it was a server error.
+	pi.pm.Observe(r.Method, cw.status, time.Since(start).Seconds())
+}
+
+// dispatch runs the attempt/retry loop for one request against one pool.
+func (s *Server) dispatch(cw *clientWriter, r *http.Request, pool *upstream.Pool, pi *poolInstr) {
+	rp := pi.rp
 	retryCfg := pool.Config().Retry
 
 	maxAttempts := retryCfg.MaxAttempts
@@ -203,8 +373,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// in a test cannot produce a zero-attempt request that hangs.
 		maxAttempts = 1
 	}
-
-	cw := &clientWriter{ResponseWriter: w}
 
 	// tried is a small slice, not a map: max_attempts is single digits in any
 	// sane config, and a linear scan over three ints beats a map allocation on
@@ -217,6 +385,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if len(candidates) == 0 {
 			// Week 1 this only happens for an empty pool, which NewPool
 			// rejects. Week 2 it is the real "everything is ejected" case.
+			pi.pm.NoUpstream()
 			http.Error(cw, "no available upstream", http.StatusServiceUnavailable)
 			return
 		}
@@ -231,6 +400,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			HashKey: "",
 		})
 		if !ok {
+			pi.pm.NoUpstream()
 			http.Error(cw, "no available upstream", http.StatusServiceUnavailable)
 			return
 		}
@@ -250,20 +420,50 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if b == nil {
 			// A strategy returned an ID outside the candidate set. Degrade to
 			// 503 rather than panicking the whole process.
+			pi.pm.NoUpstream()
 			http.Error(cw, "no available upstream", http.StatusServiceUnavailable)
 			return
 		}
 
 		st := &attemptState{target: b.URL(), key: b.Key()}
 		lastErr = s.attempt(cw, r, rp, b, st, retryCfg)
+
+		// Passive health, recorded per *attempt* rather than per request.
+		// That distinction is the entire point of the signal: a request that
+		// fails against A and succeeds on B is evidence against A and for B,
+		// and folding it into one per-request outcome would either exonerate
+		// A (because the client got a 200) or convict B (because the request
+		// had failed once). The attempt loop is the only place that can see
+		// both.
+		//
+		// The classification is health.Failed and is deliberately not
+		// reimplemented here. It counts transport errors and 5xx, and
+		// explicitly not 4xx -- a client spraying 404s must not be able to
+		// eject the pool one backend at a time.
+		//
+		// cw.status is safe to read for the failure case even though it may
+		// hold a status from nothing at all: when lastErr is non-nil,
+		// health.Failed short-circuits on the error and never looks at it.
+		pi.tracker.Record(c.ID, health.Failed(cw.status, lastErr))
+
+		// Per-upstream accounting, by array index rather than label lookup.
+		// A transport failure is recorded as its own class: the upstream
+		// produced no status, and an upstream that is hard-down would
+		// otherwise just stop appearing in this counter, which reads
+		// identically to receiving no traffic.
+		um := pi.up[c.ID]
 		if lastErr == nil {
+			um.Response(cw.status)
 			return
 		}
+		um.Failure()
+
 		tried = append(tried, c.ID)
 
 		if !canRetry(cw, r, lastErr, retryCfg, attempt, maxAttempts) {
 			break
 		}
+		pi.pm.Retry()
 	}
 
 	writeFailure(cw, r, lastErr)

@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"errors"
 	"net/http"
 	"sync"
 	"testing"
@@ -78,21 +77,31 @@ func TestNewPool_KeyIsCanonical(t *testing.T) {
 	}
 }
 
-// TestNewPool_UnimplementedStrategySurfaces is the point of the whole factory
-// contract: a Week 2 strategy named in config must fail at startup, not
+// TestNewPool_StrategyErrorsSurface is the point of the whole factory
+// contract: a strategy manifold cannot build must fail at startup, not
 // silently degrade to round-robin under traffic.
-func TestNewPool_UnimplementedStrategySurfaces(t *testing.T) {
-	for _, s := range []config.Strategy{config.StrategyLeastConn, config.StrategyConsistentHash} {
+//
+// It used to assert that least_conn and consistent_hash were unimplemented.
+// Both now exist, so the surviving gap is a name the factory does not know —
+// which reaches NewPool from code, since config validation rejects it from a
+// file. balance.ErrNotImplemented no longer has a live producer.
+func TestNewPool_StrategyErrorsSurface(t *testing.T) {
+	bogus := poolCfg("api", "http://127.0.0.1:9001")
+	bogus.Strategy = config.Strategy("weighted_random")
+	if _, err := NewPool(bogus); err == nil {
+		t.Fatal("NewPool succeeded for an unknown strategy")
+	}
+
+	for _, s := range []config.Strategy{
+		config.StrategyRoundRobin,
+		config.StrategyLeastConn,
+		config.StrategyConsistentHash,
+	} {
 		cfg := poolCfg("api", "http://127.0.0.1:9001")
 		cfg.Strategy = s
-
-		_, err := NewPool(cfg)
-		if err == nil {
-			t.Fatalf("strategy %q: NewPool succeeded, want an error", s)
-		}
-		var notImpl *balance.ErrNotImplemented
-		if !errors.As(err, &notImpl) {
-			t.Fatalf("strategy %q: error %v does not wrap *balance.ErrNotImplemented", s, err)
+		cfg.HashOn = "client_ip"
+		if _, err := NewPool(cfg); err != nil {
+			t.Errorf("strategy %q: NewPool: %v", s, err)
 		}
 	}
 }

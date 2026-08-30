@@ -161,11 +161,21 @@ func TestFactory(t *testing.T) {
 	}
 
 	for _, name := range []string{StrategyLeastConn, StrategyConsistentHash} {
-		if _, err := New(name, "client_ip"); err == nil {
-			t.Errorf("%s: want ErrNotImplemented, got nil", name)
-		} else if _, ok := err.(*ErrNotImplemented); !ok {
-			t.Errorf("%s: want *ErrNotImplemented, got %T", name, err)
+		got, err := New(name, "client_ip")
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", name, err)
+			continue
 		}
+		if got.Name() != name {
+			t.Errorf("%s: Name() = %q, want %q", name, got.Name(), name)
+		}
+	}
+
+	// consistent_hash must not fail when hashOn is empty: config validation
+	// already requires it to be set for that strategy, so the factory does
+	// not need to duplicate the check.
+	if _, err := New(StrategyConsistentHash, ""); err != nil {
+		t.Errorf("consistent_hash with empty hashOn: unexpected error %v", err)
 	}
 
 	if _, err := New("nonsense", ""); err == nil {
