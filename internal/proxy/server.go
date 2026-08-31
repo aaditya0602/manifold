@@ -39,6 +39,10 @@ import (
 // sensitive should strip it at the edge.
 const UpstreamHeader = "X-Manifold-Upstream"
 
+// proxyBuffers is shared by every pool's ReverseProxy: the buffers carry no
+// per-pool state, and one pool means a burst on any route keeps the others warm.
+var proxyBuffers = newBufferPool()
+
 // attemptState carries per-attempt data through httputil.ReverseProxy, which
 // has no other channel for it: Rewrite, ModifyResponse and ErrorHandler are
 // pool-scoped closures, but the backend and the failure are request-scoped.
@@ -316,6 +320,10 @@ func backendAvailable(b *upstream.Backend) bool { return b.Available() }
 func newReverseProxy(p *upstream.Pool, trustForwardedFor bool) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Transport: p.Transport(),
+
+		// Without this, ReverseProxy allocates a fresh 32KB copy buffer per
+		// response. See bufferpool.go for the measurements.
+		BufferPool: proxyBuffers,
 
 		// Rewrite, not Director. Director is the legacy API: it hands you the
 		// outbound request only, so it cannot see the inbound one, which is
