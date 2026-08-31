@@ -20,8 +20,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/aaditya0602/manifold/internal/balance"
+	"github.com/aaditya0602/manifold/internal/breaker"
 	"github.com/aaditya0602/manifold/internal/config"
 	"github.com/aaditya0602/manifold/internal/health"
+	"github.com/aaditya0602/manifold/internal/limit"
 	"github.com/aaditya0602/manifold/internal/observe"
 	"github.com/aaditya0602/manifold/internal/upstream"
 )
@@ -111,10 +113,34 @@ type poolInstr struct {
 	// taken in exactly the configurations nobody benchmarks.
 	tracker *health.Tracker
 
+	// limiter bounds this pool's concurrent in-flight requests. Like tracker
+	// it is never nil: a pool configured with max_in_flight 0 gets a Limiter
+	// whose Acquire returns on a single bool load, so the unlimited
+	// configuration costs a branch rather than a nil check plus a branch.
+	limiter *limit.Limiter
+
+	// breakers is indexed by upstream.Backend.ID, in step with up. Per
+	// upstream and not per pool: one sick replica out of four must cost the
+	// pool a quarter of its capacity, not all of it, and a pool-wide breaker
+	// would trip on the aggregate failure rate of a pool that is three
+	// quarters healthy.
+	breakers []*breaker.Breaker
+
 	// up is indexed by upstream.Backend.ID, which is the backend's index
 	// within its pool, so selecting an upstream's counters is an array index
 	// and never a label lookup or a map hash.
 	up []*observe.UpstreamMetrics
+}
+
+// breakerFor maps a candidate ID to its breaker, or nil for an ID outside the
+// pool. The bounds check is not paranoia about our own code: IDs round-trip
+// through balance.Strategy, and a strategy bug must degrade to a 503 rather
+// than index off the end of a slice inside a request handler.
+func (pi *poolInstr) breakerFor(id int) *breaker.Breaker {
+	if id < 0 || id >= len(pi.breakers) {
+		return nil
+	}
+	return pi.breakers[id]
 }
 
 // New builds a Server from validated config. It fails rather than starting
@@ -207,13 +233,39 @@ func NewWithMetrics(cfg *config.Config, m *observe.Metrics) (*Server, error) {
 		// that may never happen.
 		p.OnAvailabilityChange(availabilityHook(p.Name(), byKey))
 
-		s.pools[p.Name()] = &poolInstr{
-			rp:      newReverseProxy(p, cfg.Server.TrustForwardedFor),
-			pm:      pm,
-			up:      up,
-			tracker: tracker,
+		// One breaker per backend, built here and owned for the life of the
+		// Server, so the request path never constructs or looks one up.
+		breakers := make([]*breaker.Breaker, len(backends))
+		for _, b := range backends {
+			id := b.ID()
+			if id < 0 || id >= len(breakers) {
+				continue
+			}
+			br := breaker.New(p.Config().Breaker)
+			// Bound to the same UpstreamMetrics the request path uses, so a
+			// transition is an array index and an atomic add. Registered here,
+			// before the breaker is reachable from any request -- see
+			// breaker.OnTransition on why that ordering is the whole
+			// synchronisation story.
+			if um := byKey[b.Key()]; um != nil {
+				br.OnTransition(func(to breaker.State) { um.BreakerTransition(int(to)) })
+			}
+			breakers[id] = br
 		}
-		m.RegisterPoolCollector(poolStats{p})
+
+		limiter := limit.New(p.Config().Limits)
+		pm.SetInFlightLimit(limiter.Max())
+
+		pi := &poolInstr{
+			rp:       newReverseProxy(p, cfg.Server.TrustForwardedFor),
+			pm:       pm,
+			up:       up,
+			tracker:  tracker,
+			limiter:  limiter,
+			breakers: breakers,
+		}
+		s.pools[p.Name()] = pi
+		m.RegisterPoolCollector(poolStats{p: p, pi: pi})
 	}
 	return s, nil
 }
@@ -226,13 +278,20 @@ func NewWithMetrics(cfg *config.Config, m *observe.Metrics) (*Server, error) {
 // The adapter lives here rather than in observe because observe must not
 // import the data plane, and it lives here rather than in upstream because
 // upstream must not know that Prometheus exists.
-type poolStats struct{ p *upstream.Pool }
+type poolStats struct {
+	p  *upstream.Pool
+	pi *poolInstr
+}
 
 func (ps poolStats) Name() string { return ps.p.Name() }
 
-func (ps poolStats) Upstreams(yield func(key string, inflight int64, available bool)) {
+func (ps poolStats) Upstreams(yield func(key string, inflight int64, available bool, breakerState int)) {
 	for _, b := range ps.p.Backends() {
-		yield(b.Key(), b.InFlight(), backendAvailable(b))
+		state := observe.BreakerClosed
+		if br := ps.pi.breakerFor(b.ID()); br != nil {
+			state = int(br.State())
+		}
+		yield(b.Key(), b.InFlight(), backendAvailable(b), state)
 	}
 }
 
@@ -350,6 +409,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// histogram measures the work manifold actually did on behalf of a pool.
 	start := time.Now()
 
+	// Admission control comes first, before routing has cost anything beyond
+	// a match and before a single byte goes upstream. That ordering is the
+	// point of the mechanism: shedding is only cheap if it happens before the
+	// expensive part. A limiter consulted after the dial has already been
+	// paid for is a latency amplifier wearing a limiter's clothes.
+	if !pi.limiter.Acquire(r.Context()) {
+		pi.pm.Shed()
+		shed(cw)
+		pi.pm.Observe(r.Method, cw.status, time.Since(start).Seconds())
+		return
+	}
+	// Deferred, not called on each exit path. dispatch can leave through half
+	// a dozen returns and ReverseProxy can panic with http.ErrAbortHandler on
+	// a client that vanished mid-body; a slot leaked on any one of those paths
+	// lowers max_in_flight permanently, and the symptom -- a proxy that sheds
+	// at a fraction of its configured concurrency after a few days of uptime
+	// -- points at everything except the missing Release.
+	defer pi.limiter.Release()
+
 	s.dispatch(cw, r, rt.pool, pi)
 
 	// One observation point for the whole request. dispatch has half a dozen
@@ -360,6 +438,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// client vanished before anything was written, which classOf maps to
 	// "other" rather than pretending it was a server error.
 	pi.pm.Observe(r.Method, cw.status, time.Since(start).Seconds())
+}
+
+// shed writes the response for a request rejected by the limiter.
+//
+// 503 and not 429: 429 says "you, the client, are sending too much", which
+// blames a caller that may be sending one request a minute into a pool that is
+// saturated by somebody else entirely. 503 says "the service cannot take this
+// right now", which is what actually happened.
+//
+// Retry-After: 1 is a deliberate, honest guess rather than a computed backoff.
+// manifold has no queue depth to extrapolate from -- it refused instead of
+// queueing, which is the whole design -- so any number here is a hint. One
+// second is short enough that a client retrying immediately is no worse off
+// and long enough to be worth obeying. It must be set before http.Error,
+// because http.Error commits the header.
+func shed(cw *clientWriter) {
+	cw.Header().Set("Retry-After", "1")
+	http.Error(cw, "overloaded", http.StatusServiceUnavailable)
 }
 
 // dispatch runs the attempt/retry loop for one request against one pool.
@@ -416,17 +512,46 @@ func (s *Server) dispatch(cw *clientWriter, r *http.Request, pool *upstream.Pool
 			}
 		}
 
+		// Circuit breaking is applied to the strategy's pick rather than by
+		// filtering the candidate slice the strategy sees. Handing a strategy
+		// a pre-filtered set would invalidate the weight table it caches per
+		// generation -- the same reason the retry path does not filter it --
+		// and would make every request pay a scan of every breaker instead of
+		// the one it is about to use.
+		br := pi.breakerFor(c.ID)
+		if br == nil || !br.Allow() {
+			alt, altBr, found := admit(candidates, tried, pi)
+			if !found {
+				// Every candidate's breaker is open. Returning 503 here is the
+				// entire value of the feature: the alternative is to pick one
+				// anyway and pay a dial timeout per attempt against backends
+				// we have concrete, recent evidence are down -- which converts
+				// a fast failure into a slow one and keeps the sick backends
+				// under load while they try to recover.
+				pi.pm.NoUpstream()
+				http.Error(cw, "no available upstream", http.StatusServiceUnavailable)
+				return
+			}
+			c, br = alt, altBr
+		}
+
 		b := pool.Backend(c.ID)
 		if b == nil {
 			// A strategy returned an ID outside the candidate set. Degrade to
 			// 503 rather than panicking the whole process.
+			//
+			// The breaker has already admitted this attempt, so give the probe
+			// budget back before bailing out; otherwise a half-open breaker
+			// leaks a probe it will never get an outcome for and can never
+			// close again.
+			br.Failure()
 			pi.pm.NoUpstream()
 			http.Error(cw, "no available upstream", http.StatusServiceUnavailable)
 			return
 		}
 
 		st := &attemptState{target: b.URL(), key: b.Key()}
-		lastErr = s.attempt(cw, r, rp, b, st, retryCfg)
+		lastErr = s.attempt(cw, r, rp, b, br, st, retryCfg)
 
 		// Passive health, recorded per *attempt* rather than per request.
 		// That distinction is the entire point of the signal: a request that
@@ -476,6 +601,7 @@ func (s *Server) attempt(
 	r *http.Request,
 	rp *httputil.ReverseProxy,
 	b *upstream.Backend,
+	br *breaker.Breaker,
 	st *attemptState,
 	retryCfg config.RetryConfig,
 ) error {
@@ -501,10 +627,66 @@ func (s *Server) attempt(
 		}
 		b.Acquire()
 		defer b.Release()
+		// Recorded from a defer for the same reason Release is. Allow has
+		// already consumed a half-open probe from a budget of, by default,
+		// exactly one; if the outcome is dropped -- and ReverseProxy really
+		// does panic, with http.ErrAbortHandler, whenever a client disappears
+		// mid-body -- that breaker sits half-open with no budget left and
+		// rejects every request to a backend that may be perfectly healthy,
+		// forever. This is the one place in the request path where losing an
+		// update is not a lost statistic but a permanent outage.
+		defer recordBreaker(br, cw, st)
 		rp.ServeHTTP(cw, r.WithContext(ctx))
 	}()
 
 	return st.err
+}
+
+// admit walks the candidate set for one whose breaker will take an attempt,
+// preferring a backend this request has not already tried.
+//
+// It returns the breaker whose Allow *already returned true*, and the caller
+// must not call Allow on it again: in the half-open state a true return
+// consumes one probe from the budget, so a second call would either burn a
+// second probe or, with the default budget of one, refuse the attempt this
+// function just authorised.
+func admit(candidates []balance.Candidate, tried []int, pi *poolInstr) (balance.Candidate, *breaker.Breaker, bool) {
+	if c, br, ok := admitWhere(candidates, tried, pi, false); ok {
+		return c, br, true
+	}
+	// Nothing untried will take it. Falling back to an already-tried backend
+	// is not pointless: this request's earlier attempt against it failed at
+	// the transport level, but its breaker is still closed, which means the
+	// pool's recent history says it works. One more try there beats a 503.
+	return admitWhere(candidates, tried, pi, true)
+}
+
+func admitWhere(candidates []balance.Candidate, tried []int, pi *poolInstr, wantTried bool) (balance.Candidate, *breaker.Breaker, bool) {
+	for _, c := range candidates {
+		if contains(tried, c.ID) != wantTried {
+			continue
+		}
+		if br := pi.breakerFor(c.ID); br != nil && br.Allow() {
+			return c, br, true
+		}
+	}
+	return balance.Candidate{}, nil, false
+}
+
+// recordBreaker feeds one attempt outcome to the upstream's breaker.
+//
+// The classification is health.Failed, exactly as the passive tracker uses,
+// and deliberately not a second implementation of the same idea. It counts
+// transport errors and 5xx and explicitly not 4xx: a scanner spraying 404s
+// must not be able to open every breaker in the pool one backend at a time,
+// which is the same self-inflicted outage the tracker's comment describes and
+// the same reason the predicate lives in one place.
+func recordBreaker(br *breaker.Breaker, cw *clientWriter, st *attemptState) {
+	if health.Failed(cw.status, st.err) {
+		br.Failure()
+		return
+	}
+	br.Success()
 }
 
 // canRetry is the full retry gate. Every condition must hold.

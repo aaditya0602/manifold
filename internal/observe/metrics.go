@@ -184,6 +184,19 @@ type Metrics struct {
 	noUpstream       *prometheus.CounterVec
 	availability     *prometheus.CounterVec
 
+	breakerTransitions *prometheus.CounterVec
+	shed               *prometheus.CounterVec
+	inflightLimit      *prometheus.GaugeVec
+
+	// configReloads is resolved into configReload at construction. Nothing in
+	// this package or in the data plane calls it: it is wired up by the hot
+	// reload path in cmd/manifold, which increments it once per reload signal.
+	// It is declared here rather than there because every manifold metric
+	// family lives in this file, and a reload counter registered from cmd
+	// would be the one series that is not.
+	configReloads *prometheus.CounterVec
+	configReload  [numReloadResults]prometheus.Counter
+
 	noRoute   prometheus.Counter
 	collector *poolCollector
 
@@ -252,6 +265,49 @@ func New(version string) *Metrics {
 		Help: "Transitions of an upstream into or out of the available set, by the state it moved to.",
 	}, []string{"pool", "upstream", "state"})
 
+	// Breaker transitions are edges, exactly as availability changes are, and
+	// for the same reason: manifold_breaker_state is a gauge read at scrape
+	// time and cannot show a breaker that tripped and recovered between two
+	// scrapes. A breaker that flaps is the signal that failure_threshold is
+	// mistuned, and it is invisible without this.
+	m.breakerTransitions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "manifold_breaker_transitions_total",
+		Help: "Circuit breaker state transitions, by the state moved to.",
+	}, []string{"pool", "upstream", "to"})
+
+	// Shedding is deliberately its own family rather than a status class of
+	// manifold_requests_total. A shed request is manifold working correctly
+	// under overload; an upstream 503 is a backend failing. Both reach the
+	// client as a 503, so without a separate counter the single most important
+	// operational distinction in this system -- "are we protecting ourselves
+	// or are we broken" -- is unanswerable from the metrics.
+	m.shed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "manifold_requests_shed_total",
+		Help: "Requests rejected with 503 because the pool was at max_in_flight.",
+	}, []string{"pool"})
+
+	// A gauge rather than a number an operator reads out of the config file,
+	// because the bound that matters during an incident is the one the running
+	// process is enforcing. Set once at startup; 0 means unlimited.
+	m.inflightLimit = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "manifold_inflight_limit",
+		Help: "Configured max_in_flight for the pool. 0 means unlimited.",
+	}, []string{"pool"})
+
+	m.configReloads = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "manifold_config_reloads_total",
+		Help: "Configuration reload attempts, by outcome.",
+	}, []string{"result"})
+	// Both children are resolved now so ConfigReload is an array index and an
+	// atomic add, and -- more usefully -- so that both series exist from the
+	// first scrape. A failure counter that only appears after the first
+	// failure cannot be alerted on with rate(), because there is no series to
+	// write the alert against until the thing you wanted to catch has already
+	// happened.
+	for i, name := range reloadResultNames {
+		m.configReload[i] = m.configReloads.WithLabelValues(name)
+	}
+
 	m.noRoute = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "manifold_requests_no_route_total",
 		Help: "Requests rejected with 404 because no route matched.",
@@ -271,6 +327,10 @@ func New(version string) *Metrics {
 		m.retries,
 		m.noUpstream,
 		m.availability,
+		m.breakerTransitions,
+		m.shed,
+		m.inflightLimit,
+		m.configReloads,
 		m.noRoute,
 		m.collector,
 	)
@@ -293,6 +353,35 @@ func (m *Metrics) Handler() http.Handler {
 		// stack collections against the same live pools.
 		MaxRequestsInFlight: 4,
 	})
+}
+
+// Config reload outcomes.
+const (
+	reloadSuccess = iota
+	reloadFailure
+	numReloadResults
+)
+
+var reloadResultNames = [numReloadResults]string{"success", "failure"}
+
+// ConfigReload records one configuration reload attempt.
+//
+// Nothing calls this yet: it is the accessor the hot reload path in
+// cmd/manifold uses when it lands. It lives here because this file owns every
+// metric family manifold exposes, and splitting registration across two
+// packages is how a family ends up registered twice in one registry and
+// panicking at startup.
+//
+// A failed reload is the quietest dangerous event a proxy has: the process
+// keeps serving happily on the *old* config, so nothing pages and nothing
+// looks broken, while the change the operator believes they shipped is not
+// running. This counter is what makes that visible.
+func (m *Metrics) ConfigReload(success bool) {
+	if success {
+		m.configReload[reloadSuccess].Inc()
+		return
+	}
+	m.configReload[reloadFailure].Inc()
 }
 
 // NoRoute is the counter for requests that matched no route. Resolve it once
@@ -319,6 +408,8 @@ func (m *Metrics) Pool(name string) *PoolMetrics {
 		duration:   m.duration.WithLabelValues(name),
 		retries:    m.retries.WithLabelValues(name),
 		noUpstream: m.noUpstream.WithLabelValues(name),
+		shed:       m.shed.WithLabelValues(name),
+		limit:      m.inflightLimit.WithLabelValues(name),
 		name:       name,
 		parent:     m,
 		upstreams:  make(map[string]*UpstreamMetrics),
@@ -354,6 +445,8 @@ type PoolMetrics struct {
 	duration   prometheus.Observer
 	retries    prometheus.Counter
 	noUpstream prometheus.Counter
+	shed       prometheus.Counter
+	limit      prometheus.Gauge
 
 	name   string
 	parent *Metrics
@@ -377,6 +470,14 @@ func (pm *PoolMetrics) Retry() { pm.retries.Inc() }
 // backend.
 func (pm *PoolMetrics) NoUpstream() { pm.noUpstream.Inc() }
 
+// Shed records one request rejected because the pool was already at
+// max_in_flight. One atomic add: it runs on the overload path, which is the
+// worst possible moment to be doing anything more expensive.
+func (pm *PoolMetrics) Shed() { pm.shed.Inc() }
+
+// SetInFlightLimit publishes the pool's configured bound. Startup only.
+func (pm *PoolMetrics) SetInFlightLimit(n int64) { pm.limit.Set(float64(n)) }
+
 // Name is the pool's config name.
 func (pm *PoolMetrics) Name() string { return pm.name }
 
@@ -395,6 +496,9 @@ func (pm *PoolMetrics) Upstream(key string) *UpstreamMetrics {
 	}
 	for si, state := range availabilityStateNames {
 		um.availability[si] = pm.parent.availability.WithLabelValues(pm.name, key, state)
+	}
+	for bi, state := range BreakerStateNames {
+		um.breaker[bi] = pm.parent.breakerTransitions.WithLabelValues(pm.name, key, state)
 	}
 	pm.upstreams[key] = um
 	return um
@@ -419,6 +523,40 @@ type UpstreamMetrics struct {
 	// availability is indexed by the stateAvailable/stateUnavailable
 	// constants, so a bool selects a counter without a branch into a map.
 	availability [numAvailabilityStates]prometheus.Counter
+
+	// breaker is indexed by BreakerClosed/BreakerOpen/BreakerHalfOpen, which
+	// are numerically identical to breaker.State. Taking an int rather than
+	// the real type is what keeps this package free of any import from the
+	// data plane -- observe is imported *by* proxy, never the other way round.
+	breaker [NumBreakerStates]prometheus.Counter
+}
+
+// Circuit breaker states, as observe sees them.
+//
+// These mirror breaker.State's values exactly and must stay in step with it.
+// The duplication is deliberate: importing internal/breaker here would make
+// the instrumentation package depend on the data plane, which is the same
+// inversion PoolStater exists to avoid.
+const (
+	BreakerClosed = iota
+	BreakerOpen
+	BreakerHalfOpen
+	NumBreakerStates
+)
+
+// BreakerStateNames are the label values for a breaker state, in index order.
+// They are also what manifold_breaker_state's numeric values decode to.
+var BreakerStateNames = [NumBreakerStates]string{"closed", "open", "half_open"}
+
+// BreakerTransition records one circuit breaker state change for this
+// upstream. state is a BreakerClosed/BreakerOpen/BreakerHalfOpen index; an
+// out-of-range value is dropped rather than panicking, because this is called
+// from a hook running on a goroutine that is serving a request.
+func (um *UpstreamMetrics) BreakerTransition(state int) {
+	if state < 0 || state >= NumBreakerStates {
+		return
+	}
+	um.breaker[state].Inc()
 }
 
 // AvailabilityChange records one transition of this upstream into or out of

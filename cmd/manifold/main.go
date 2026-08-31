@@ -23,6 +23,7 @@ import (
 	"github.com/aaditya0602/manifold/internal/config"
 	"github.com/aaditya0602/manifold/internal/observe"
 	"github.com/aaditya0602/manifold/internal/proxy"
+	"github.com/aaditya0602/manifold/internal/reload"
 )
 
 func main() {
@@ -38,6 +39,14 @@ func run() error {
 		checkOnly   = flag.Bool("check", false, "validate the configuration and exit")
 		logLevel    = flag.String("log-level", "info", "debug, info, warn, or error")
 		showVersion = flag.Bool("version", false, "print version and exit")
+		// Watching is opt-in. SIGHUP is the operational contract and works
+		// everywhere; a filesystem watch is a convenience that costs an
+		// inotify handle on the config directory and, on a directory somebody
+		// else writes to, a wakeup per unrelated file. Defaulting it off also
+		// means the deployment that reloads deliberately -- config pushed,
+		// then signalled -- cannot be surprised by a half-written file being
+		// picked up early.
+		watch = flag.Bool("watch", false, "reload when the config file changes on disk (SIGHUP always works)")
 	)
 	flag.Parse()
 
@@ -88,6 +97,33 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// The supervisor owns the live *proxy.Server from here on. It is the
+	// handler http.Server sees, it is set once, and it is never replaced --
+	// swapping http.Server.Handler under an accept loop is a data race, and
+	// rebuilding the listener to apply a new config would drop every
+	// keep-alive connection it holds, which is the exact failure hot reload
+	// exists to avoid.
+	sup := reload.New(*configPath, cfg, px, reload.Options{
+		Build: func(c *config.Config) (*proxy.Server, error) {
+			// Every generation shares one metrics registry: the counters have
+			// to be continuous across a reload, or a dashboard would see every
+			// series reset to zero each time an operator edited a file.
+			return proxy.NewWithMetrics(c, metrics)
+		},
+		Logger: logger,
+		// manifold_config_reloads_total{result}. The supervisor reports
+		// success/failure through this callback rather than importing observe
+		// itself, so the counter is attached from the one place that already
+		// owns the registry, and a Supervisor under test is not obliged to
+		// have one.
+		//
+		// reload reports a string so that package need not import observe;
+		// observe takes a bool so both of its children can be resolved at
+		// construction. Adapt here, where both types are already in scope.
+		OnResult: func(result string) { metrics.ConfigReload(result == reload.ResultSuccess) },
+	})
+	defer sup.Close()
+
 	// Health checking starts before the listeners bind. The ordering is
 	// deliberate: with active checks enabled, every backend starts assumed
 	// healthy, so a proxy that accepted traffic first would spend its first
@@ -95,11 +131,14 @@ func run() error {
 	// -- including, after a restart into a partial outage, to origins that are
 	// already down. Starting the probers first gives them a head start on the
 	// first client, and it costs nothing: Start returns immediately.
-	px.Start(ctx)
+	//
+	// It goes through the supervisor so that ctx is recorded as the lifetime
+	// of every server a later reload builds, not just this one.
+	sup.Start(ctx)
 
 	dataSrv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           px,
+		Handler:           sup,
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.D(),
 		ReadTimeout:       cfg.Server.ReadTimeout.D(),
 		WriteTimeout:      cfg.Server.WriteTimeout.D(),
@@ -114,6 +153,26 @@ func run() error {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
 
+	// SIGHUP is the reload trigger, on its own channel rather than through
+	// the shutdown context: a reload must not look anything like a shutdown,
+	// and a buffered channel means a signal that lands mid-reload is queued
+	// rather than dropped by the runtime.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go sup.HandleSignals(ctx, hup)
+
+	if *watch {
+		go func() {
+			// A watcher that dies must not be silent: the operator would go on
+			// editing files and wondering why nothing happens. SIGHUP still
+			// works, so this is a warning rather than a fatal error.
+			if err := sup.Watch(ctx, 0); err != nil {
+				slog.Error("config watch stopped; SIGHUP still reloads", "err", err)
+			}
+		}()
+	}
+
 	// A server that fails to bind must take the process down rather than
 	// leaving a half-running proxy that looks healthy.
 	errCh := make(chan error, 2)
@@ -126,6 +185,7 @@ func run() error {
 		"admin", cfg.Admin,
 		"pools", len(cfg.Pools),
 		"routes", len(cfg.Routes),
+		"watch", *watch,
 	)
 
 	select {
@@ -146,11 +206,15 @@ func run() error {
 	// landed. Close also waits for the prober and tracker goroutines to exit,
 	// so the process does not exit while it still has probes on the wire.
 	//
-	// px.Start's context is already cancelled by now (it is ctx, and stop()
+	// Start's context is already cancelled by now (it is ctx, and stop()
 	// above released it), which makes this the wait rather than the signal --
 	// but Close cancels its own derived context too, so this is correct even
 	// when Start was handed an uncancellable one.
-	px.Close()
+	//
+	// It goes through the supervisor because after a reload the live server is
+	// no longer px: the supervisor closes whichever generation is current, and
+	// every earlier one was already closed by the reload that replaced it.
+	sup.Close()
 
 	return drainErr
 }

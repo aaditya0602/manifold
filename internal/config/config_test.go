@@ -593,3 +593,29 @@ func TestExampleConfigIsValid(t *testing.T) {
 		}
 	}
 }
+
+// TestDuplicateUpstreamsAreComparedCanonically pins the fix for a real gap:
+// validation deduped on the literal URL string while upstream.NewPool dedupes
+// on the lower-cased scheme+host, so a config differing only in case validated
+// clean and then failed to build. `manifold -check` reported ok for a config
+// that could not start.
+func TestDuplicateUpstreamsAreComparedCanonically(t *testing.T) {
+	const doc = `
+listen: ":8080"
+pools:
+  - name: api
+    upstreams:
+      - url: http://127.0.0.1:9001
+      - url: HTTP://127.0.0.1:9001
+routes:
+  - match: {path_prefix: /}
+    pool: api
+`
+	_, err := Parse([]byte(doc))
+	if err == nil {
+		t.Fatal("two upstreams differing only in scheme case were accepted; upstream.NewPool would reject them")
+	}
+	if !strings.Contains(err.Error(), "duplicate upstream") {
+		t.Fatalf("rejected, but not as a duplicate: %v", err)
+	}
+}

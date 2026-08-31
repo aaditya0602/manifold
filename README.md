@@ -4,7 +4,7 @@ An L7 HTTP load balancer in Go — path/header routing across upstream pools, wi
 
 An intake manifold splits one flow across many outlets. So does this.
 
-> **Status: Week 2 of 4.** The proxy serves real traffic across multiple upstreams with all three balancing strategies, active and passive health checking, automatic ejection and readmission, and Prometheus metrics. Circuit breaking, backpressure, hot reload, and tracing are not built yet. The roadmap below marks exactly what exists and what does not, and this README will not claim otherwise before the code lands.
+> **Status: Week 3 of 4.** The proxy serves real traffic across multiple upstreams with all three balancing strategies, active and passive health checking, per-upstream circuit breaking, bounded in-flight backpressure, hot config reload, and Prometheus metrics. Distributed tracing is not built yet, and the full benchmark matrix has not been run. The roadmap below marks exactly what exists and what does not, and this README will not claim otherwise before the code lands.
 
 ---
 
@@ -20,6 +20,9 @@ X-Manifold-Upstream: http://127.0.0.1:9002
 - **Active health checking** — out-of-band probes on their own transport, with configurable interval, timeout, and consecutive-success/failure thresholds.
 - **Passive ejection** — a sliding error-rate window over real traffic, so a backend that answers `/healthz` but fails actual requests is still removed. Automatic readmission after a cooldown.
 - **Retry policy** that is narrow on purpose: connection-level failures only, idempotent methods only, only before a byte has reached the client, only when the body is replayable, and never onto a backend already tried.
+- **Per-upstream circuit breaking** — closed/open/half-open, with a strictly enforced half-open probe budget, held in a single atomic word.
+- **Bounded in-flight backpressure** — a per-pool concurrency cap that sheds with 503 rather than queueing without limit.
+- **Hot config reload** — SIGHUP or optional file watching, with an atomic swap and a bounded drain of the previous generation. A bad config is rejected and the running proxy keeps serving.
 - **Prometheus metrics** on the admin listener — request and upstream counters, a latency histogram bucketed for this proxy's actual p50 and p99, live in-flight and availability gauges.
 - **Graceful drain** on SIGINT/SIGTERM with a bounded deadline.
 - **Config validation** that reports every problem at once with YAML paths, rejects unknown keys at any nesting depth, and distinguishes an omitted key from one explicitly set to zero or false.
@@ -41,9 +44,9 @@ X-Manifold-Upstream: http://127.0.0.1:9002
 | Week 2 | Passive ejection on error rate | **done** |
 | Week 2 | Least-connections, consistent hash | **done** |
 | Week 2 | Prometheus `/metrics` | **done** |
-| Week 3 | Circuit breaker, half-open probing | not started |
-| Week 3 | Bounded in-flight, 503 shedding | not started |
-| Week 3 | Hot config reload, zero dropped connections | not started |
+| Week 3 | Circuit breaker, half-open probing | **done** |
+| Week 3 | Bounded in-flight, 503 shedding | **done** |
+| Week 3 | Hot config reload, zero dropped connections | **done** |
 | Week 3 | OpenTelemetry spans | not started |
 | Week 4 | Benchmark results + methodology | not started |
 
@@ -62,6 +65,19 @@ The plan's gate was *"a backend killed under load is ejected and re-admitted aut
 Zero errors during the detection window was not required — retries absorbed every request that hit the dying backend before the prober noticed.
 
 One honest correction to the plan's phrasing: **"ejection within 2x the health-check interval" is an expectation, not a worst-case bound.** The prober randomises each backend's probe phase to avoid a self-inflicted thundering herd, so the first probe after a failure falls uniformly in `[0, interval)`. `unhealthy_threshold x interval` is therefore the mean; the true worst case is that plus one probe round-trip.
+
+### Week 3 acceptance gate
+
+The plan's gate was *"10 consecutive config reloads at sustained load with **zero** dropped connections."* `TestReload_TenReloadsUnderLoadDropZeroConnections` drives concurrent traffic over a real socket through a real `http.Server` while reloading ten times. Across five consecutive runs:
+
+| | measured |
+|---|---|
+| Requests per run | 8,086 – 11,596 |
+| Non-2xx responses | **0** |
+| Connection errors | **0** |
+| Ten reloads completed in | 318 – 380 ms |
+
+Every response is counted, not sampled, and a body that fails to read to completion counts as a dropped connection even behind a `200` status line. Both the old and new backend sets are verified to have served traffic, so the test cannot pass by the swap silently not happening.
 
 ## Quickstart
 
@@ -132,6 +148,16 @@ parse: yaml: unmarshal errors:
 
 **Metric labels are a closed set.** HTTP method is client-controlled, so it is collapsed to nine known verbs plus `OTHER`; an unbounded label there is a memory-exhaustion vector, not just a cardinality annoyance. Label children are resolved once at startup, never per request — instrumentation costs 36ns and zero allocations per request, asserted by a test.
 
+**The circuit breaker is a single atomic word.** State, both counters, and the reopen deadline are packed into one `uint64`. That is correctness, not micro-optimisation: opening must publish *"state is Open"* and *"until T"* as one act. Split across two words, publishing the deadline first lets a stale writer clobber a newer one, and publishing the state first lets a concurrent `Allow` read Open with the previous cycle's expired deadline and promote straight to half-open — re-hammering the backend that just failed. One word, one CAS, neither window exists.
+
+**The open→half-open transition and the first probe admission are the same CAS.** Transitioning first and admitting after would let the entire backlog observe "half-open, budget free" simultaneously and stampede a backend that has just told you it is sick.
+
+**Shedding answers 503, not 429.** 429 blames the caller, who may be sending one request a minute into a pool saturated by someone else. `Retry-After: 1` is an honest hint rather than a computed backoff, because manifold deliberately keeps no queue depth to extrapolate from.
+
+**A failed reload keeps serving the old config.** Parse errors and configs that validate but cannot build both leave the running proxy untouched. A config typo must never be able to take down a healthy proxy.
+
+**The new server is swapped in before the old one is drained.** In-flight requests still hold the old server; closing it at swap time is precisely how connections get dropped. The old generation is retired only once its in-flight count reaches zero, bounded by `drain_timeout`.
+
 ## What is standard library, and what is not
 
 This matters, and overclaiming it is the kind of thing an infra interviewer catches in one question.
@@ -143,7 +169,7 @@ This matters, and overclaiming it is the kind of thing an infra interviewer catc
 - **Hop-by-hop header stripping** — `ReverseProxy`, including headers a client names in its own `Connection` header.
 - **Graceful shutdown primitive** — `http.Server.Shutdown`.
 
-**This project implements:** the routing table and match evaluation, the balancing strategies, the retry policy and its safety conditions, the trust model for forwarding headers, per-pool transport construction and backend accounting, config schema/validation/presence-aware defaulting, the drain orchestration across two listeners, active and passive health checking with ejection and readmission, and the Prometheus instrumentation — and, in the weeks ahead, circuit breaking, backpressure, hot reload, and tracing.
+**This project implements:** the routing table and match evaluation, the balancing strategies, the retry policy and its safety conditions, the trust model for forwarding headers, per-pool transport construction and backend accounting, config schema/validation/presence-aware defaulting, the drain orchestration across two listeners, active and passive health checking with ejection and readmission, the Prometheus instrumentation, per-upstream circuit breaking, bounded in-flight backpressure, and hot configuration reload with atomic swap and bounded drain — and, in the week ahead, distributed tracing.
 
 ## Limitations
 
@@ -201,7 +227,7 @@ Targets this project set for itself, reported whether or not they are met:
 |---|---|
 | Within 20% of nginx throughput at c=1000, 1ms backends | **not met** — 28.4% at c=50; c=1000 not yet measured |
 | p99 overhead over direct under 2ms at c=200 | not yet measured (2.71ms at c=50) |
-| Zero dropped connections across 10 hot reloads | not yet built (Week 3) |
+| Zero dropped connections across 10 hot reloads | **met** — 0 of ~10,000 requests, five consecutive runs |
 | Backend ejection within 2x the health-check interval | **met** — 38-58ms against a 60ms target, zero client errors |
 
 ## Development

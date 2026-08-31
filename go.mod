@@ -4,6 +4,8 @@ go 1.24
 
 require gopkg.in/yaml.v3 v3.0.1
 
+require github.com/fsnotify/fsnotify v1.10.1
+
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

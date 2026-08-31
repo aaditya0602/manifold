@@ -20,7 +20,11 @@ type PoolStater interface {
 	// Upstreams reports each backend's live state, calling yield once per
 	// backend. It is called during a Prometheus scrape, on a goroutine that is
 	// not serving traffic, and must not retain yield.
-	Upstreams(yield func(key string, inflight int64, available bool))
+	//
+	// breakerState is a BreakerClosed/BreakerOpen/BreakerHalfOpen index. It is
+	// an int rather than the real breaker.State for the same reason this is an
+	// interface at all: observe must not import the data plane.
+	Upstreams(yield func(key string, inflight int64, available bool, breakerState int))
 }
 
 // poolCollector implements prometheus.Collector for the two gauges that must
@@ -37,6 +41,14 @@ type PoolStater interface {
 type poolCollector struct {
 	inflight  *prometheus.Desc
 	available *prometheus.Desc
+
+	// breaker is here rather than mirrored by the request path for exactly the
+	// same reason as the other two. The breaker's state already lives in one
+	// authoritative atomic word that Allow reads on every attempt; publishing
+	// a second copy would mean a store on the hot path to maintain a number
+	// that can only ever be a staler version of the one we can simply read
+	// when Prometheus asks.
+	breaker *prometheus.Desc
 
 	// mu guards pools. Registration happens at startup and collection happens
 	// on scrape, so this is an uncontended read lock in practice; it exists
@@ -58,6 +70,11 @@ func newPoolCollector() *poolCollector {
 			"1 if the upstream is currently eligible to receive traffic, 0 if it is not.",
 			[]string{"pool", "upstream"}, nil,
 		),
+		breaker: prometheus.NewDesc(
+			"manifold_breaker_state",
+			"Circuit breaker state for the upstream: 0 closed, 1 open, 2 half_open.",
+			[]string{"pool", "upstream"}, nil,
+		),
 	}
 }
 
@@ -76,6 +93,7 @@ func (c *poolCollector) add(p PoolStater) {
 func (c *poolCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.inflight
 	ch <- c.available
+	ch <- c.breaker
 }
 
 func (c *poolCollector) Collect(ch chan<- prometheus.Metric) {
@@ -85,7 +103,7 @@ func (c *poolCollector) Collect(ch chan<- prometheus.Metric) {
 
 	for _, p := range pools {
 		name := p.Name()
-		p.Upstreams(func(key string, inflight int64, available bool) {
+		p.Upstreams(func(key string, inflight int64, available bool, breakerState int) {
 			ch <- prometheus.MustNewConstMetric(
 				c.inflight, prometheus.GaugeValue, float64(inflight), name, key,
 			)
@@ -95,6 +113,9 @@ func (c *poolCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 			ch <- prometheus.MustNewConstMetric(
 				c.available, prometheus.GaugeValue, up, name, key,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.breaker, prometheus.GaugeValue, float64(breakerState), name, key,
 			)
 		})
 	}

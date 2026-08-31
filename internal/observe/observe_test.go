@@ -86,6 +86,7 @@ type stubPool struct {
 	keys      []string
 	inflight  []atomic.Int64
 	available []atomic.Bool
+	breaker   []atomic.Int32
 }
 
 func newStubPool(name string, keys ...string) *stubPool {
@@ -94,14 +95,15 @@ func newStubPool(name string, keys ...string) *stubPool {
 		keys:      keys,
 		inflight:  make([]atomic.Int64, len(keys)),
 		available: make([]atomic.Bool, len(keys)),
+		breaker:   make([]atomic.Int32, len(keys)),
 	}
 }
 
 func (s *stubPool) Name() string { return s.name }
 
-func (s *stubPool) Upstreams(yield func(string, int64, bool)) {
+func (s *stubPool) Upstreams(yield func(string, int64, bool, int)) {
 	for i, k := range s.keys {
-		yield(k, s.inflight[i].Load(), s.available[i].Load())
+		yield(k, s.inflight[i].Load(), s.available[i].Load(), int(s.breaker[i].Load()))
 	}
 }
 
@@ -116,6 +118,12 @@ var allFamilies = []string{
 	"manifold_retries_total",
 	"manifold_requests_no_route_total",
 	"manifold_requests_no_upstream_total",
+	"manifold_upstream_availability_changes_total",
+	"manifold_breaker_state",
+	"manifold_breaker_transitions_total",
+	"manifold_requests_shed_total",
+	"manifold_inflight_limit",
+	"manifold_config_reloads_total",
 }
 
 // TestRegistration_NoDuplicatePanic covers the failure mode that only ever

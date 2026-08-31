@@ -137,12 +137,6 @@ func validateUpstreams(p *problems, at string, ups []UpstreamConfig) {
 			p.addf("%s.url: required", uat)
 			continue
 		}
-		if first, dup := seenURL[u.URL]; dup {
-			p.addf("%s.url: duplicate upstream %q, already declared at %s.upstreams[%d]", uat, u.URL, at, first)
-		} else {
-			seenURL[u.URL] = i
-		}
-
 		parsed, err := url.Parse(u.URL)
 		if err != nil {
 			p.addf("%s.url: not a valid URL %q: %v", uat, u.URL, err)
@@ -166,6 +160,23 @@ func validateUpstreams(p *problems, at string, ups []UpstreamConfig) {
 		}
 		if parsed.Fragment != "" {
 			p.addf("%s.url: must not contain a fragment, got %q", uat, parsed.Fragment)
+		}
+
+		// Duplicate detection runs on the canonical origin, not the literal
+		// string, and must match how upstream.NewPool canonicalises: scheme and
+		// host lower-cased. Comparing raw strings here let
+		// "http://x:9001" and "HTTP://x:9001" validate clean and then fail at
+		// pool construction, so `manifold -check` reported ok for a config that
+		// could not start -- exactly the failure -check exists to prevent.
+		//
+		// The two normalisations are duplicated rather than shared because
+		// upstream imports config; the reverse would be an import cycle. If one
+		// changes, the other must.
+		canon := strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
+		if first, dup := seenURL[canon]; dup {
+			p.addf("%s.url: duplicate upstream %q, already declared at %s.upstreams[%d] (compared as %q)", uat, u.URL, at, first, canon)
+		} else {
+			seenURL[canon] = i
 		}
 	}
 }
