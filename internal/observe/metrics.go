@@ -433,6 +433,12 @@ func (m *Metrics) Pool(name string) *PoolMetrics {
 // a panic skipped a decrement.
 func (m *Metrics) RegisterPoolCollector(p PoolStater) { m.collector.add(p) }
 
+// UnregisterPoolCollector drops a pool registered by RegisterPoolCollector. A
+// Server that is being retired must call this, or its pools keep being
+// scraped alongside the generation that replaced them and every scrape fails
+// as a duplicate. See poolCollector.remove.
+func (m *Metrics) UnregisterPoolCollector(p PoolStater) { m.collector.remove(p) }
+
 // PoolMetrics is one pool's pre-resolved children. Every field is a concrete
 // child metric; there is no *Vec here on purpose, because reaching a *Vec at
 // request time is exactly the label lookup this type exists to avoid.

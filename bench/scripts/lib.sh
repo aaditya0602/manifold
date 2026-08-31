@@ -473,12 +473,17 @@ render_manifold_config() {
   local strategy="$1" out_path="$2"
   require_file "${REPO_ROOT}/config.example.yaml" "should ship with the repo"
 
-  python3 - "$strategy" "$out_path" <<'PYEOF'
+  python3 - "$strategy" "$out_path" "${REPO_ROOT}/config.example.yaml" <<'PYEOF'
 import re
 import sys
 
-strategy, out_path = sys.argv[1], sys.argv[2]
-with open("config.example.yaml", "r", encoding="utf-8") as f:
+# The source config is passed as an absolute path. It used to be opened as the
+# bare relative name "config.example.yaml", which only worked when the caller
+# happened to be sitting in the repo root -- running the harness from anywhere
+# else died with FileNotFoundError from inside a heredoc, several frames away
+# from anything that mentioned a config.
+strategy, out_path, src_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src_path, "r", encoding="utf-8") as f:
     text = f.read()
 
 text = re.sub(r'strategy:\s*\S+', f'strategy: {strategy}', text, count=1)

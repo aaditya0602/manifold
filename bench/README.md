@@ -16,7 +16,9 @@ any number that comes out of it.
   directly.
 - `bench/scripts/run-matrix.sh` -- the full benchmark matrix.
 - `bench/scripts/run-failure-scenarios.sh` -- the 5 resilience
-  experiments.
+  experiments. Manifold-only, asserts its targets, and exits 0 / 2 / 1
+  for pass / target missed / harness broken. See "The five failure
+  scenarios".
 - `bench/scripts/load.js` -- the k6 load generator both of the above
   drive.
 - `bench/scripts/parse-results.py` -- turns a results directory into a
@@ -319,11 +321,13 @@ the headline manifold-vs-nginx comparison.
 
 ## Battery / AC power pre-flight check
 
-`run-matrix.sh` (and `run-failure-scenarios.sh`) check
-`/sys/class/power_supply/*/{online,status}` before doing anything else. If
-the machine looks like it's running on battery, the script **refuses to
-proceed** with an explanation, since a benchmark run under battery-mode
-power/thermal throttling is not reproducible and would silently
+Both drivers read `/sys/class/power_supply/*/{online,status}` before doing
+anything else, but they act on it differently, because they measure
+different things.
+
+`run-matrix.sh` **refuses to proceed** on battery. It produces
+throughput and latency numbers whose only meaning is relative to each
+other, and battery-mode power/thermal throttling would silently
 contaminate every number in the run.
 
 ```bash
@@ -335,12 +339,195 @@ contaminate every number in the run.
 FORCE=1 ./bench/scripts/run-matrix.sh
 ```
 
+`run-failure-scenarios.sh` **warns and continues**. It measures whether a
+state machine fires and how long it takes relative to configured
+thresholds that are whole seconds wide (a 2s health-check interval, a 5s
+breaker `open_for`); a frequency cap does not change whether a breaker
+opens. Refusing there only ever produced an exit 1 before any work was
+done. The observed state is recorded as `power_state` in the run's
+`summary.json`, so a battery run is never silently compared against an AC
+one. `STRICT_AC=1` restores the refusal:
+
+```bash
+# warns on battery, runs anyway, records power_state=battery:
+./bench/scripts/run-failure-scenarios.sh
+
+# refuse on battery instead:
+STRICT_AC=1 ./bench/scripts/run-failure-scenarios.sh
+```
+
 Note the honesty limit here too: WSL2 frequently does not expose host
 battery/AC state to the guest at all, in which case
 `/sys/class/power_supply/` has no entries and the check can only warn
 that it couldn't determine the power state, not block. If you see that
 warning, verify manually that the laptop is plugged in before trusting
 the run.
+
+## The five failure scenarios
+
+`run-failure-scenarios.sh` is manifold-only. nginx OSS has no circuit
+breaker, no passive ejection and no active health checking, and hot
+reload is a manifold feature by definition, so there is nothing
+comparable to run on the other side.
+
+### How events are detected
+
+Every state transition is read numerically off manifold's own admin
+listener (`:9090/metrics`), not inferred from client traffic:
+
+| metric | used for |
+|--------|----------|
+| `manifold_upstream_available{pool,upstream}` (1 available / 0 not) | ejection (1 to 0) and readmission (0 to 1) |
+| `manifold_breaker_state{pool,upstream}` (0 closed / 1 open / 2 half-open) | breaker trip |
+| `manifold_breaker_transitions_total{pool,upstream,to}` | confirming a `to="open"` edge was recorded |
+| `manifold_upstream_requests_total{pool,upstream,status_class}` | proving traffic actually stopped reaching a tripped upstream |
+| `manifold_requests_shed_total{pool}` | `max_in_flight` backpressure (this suite does not exercise it; expect 0) |
+
+Two things this replaced, both of which produced meaningless output:
+
+- **Client-side event detection.** With `retry.max_attempts: 2` over
+  three upstreams, one dead or slow backend is *invisible* to a caller:
+  the retry lands on a healthy peer and the client still sees 200. A
+  detector waiting for client errors to appear and then stop has nothing
+  to detect. The curl probe stream and the k6 background load are still
+  recorded, but as the client-visible **blast radius** of each event --
+  which is the number a reader actually wants -- never as the detector.
+- **Grepping metric names for words.** There is no metric whose *name*
+  contains "open"; the breaker state is a *value*. The old
+  `grep -Ei 'breaker.*open'` matched the `# HELP` line of
+  `manifold_breaker_state` on every scrape, so it was a constant and
+  carried no information either way.
+
+`METRIC_POLL_S` (default `0.05`) sets the poll cadence; every
+metric-derived timing is emitted alongside `metric_poll_resolution_ms` so
+no one reads more precision into it than it has.
+
+### 1. Kill one backend at steady state — `01-kill-backend.json`
+
+Three backends under `BACKGROUND_LOAD_VUS` (100) VUs of k6 plus a 10 rps
+curl probe. After 8s of steady state, backend 9001 is `SIGKILL`ed.
+
+- **Headline:** `time_to_ejection_s` — SIGKILL until
+  `manifold_upstream_available` for 9001 reads 0.
+- **Asserts:** ejection within `unhealthy_threshold x interval + probe
+  timeout + 2s` slack (8.5s with the shipped config), and zero
+  client-visible failures after ejection.
+- **Expect** roughly 5-6s with `config.example.yaml`: the passive
+  tracker's 10s sliding window is full of pre-kill successes, so it
+  cannot cross `error_rate: 0.5` before the active prober's
+  `unhealthy_threshold: 3` x `interval: 2s` gets there first. The Go gate
+  test's 38-58ms figure is the same code path with a 30ms probe interval.
+- `requests_failed` is expected to be **0**: retry masks the dead backend
+  end to end.
+
+### 2. Restart it — `02-restart-backend.json`
+
+Kills 9001 *before* any load, waits until ejection is actually observed
+(rather than sleeping a guessed interval), then starts load and restarts
+the process. Killing before the load starts is deliberate: with no
+traffic the passive tracker records nothing, so nothing is ejected with a
+30s `eject_for` hold and readmission is governed purely by the active
+checker.
+
+- **Headline:** `approx_time_to_readmission_s` — process restart until
+  `manifold_upstream_available` reads 1 again.
+- **Asserts:** readmission within `healthy_threshold x interval + probe
+  timeout + 2s` (6.5s shipped), and that the backend's own
+  `/_control/stats` shows it served real requests afterwards. Rejoining
+  the candidate set is not the same as receiving traffic; a strategy
+  caching a ring keyed on a generation that never moved would pass the
+  timing check and still never route there.
+- **Expect** roughly 3s.
+
+### 3. Hot config reload x10 under load — `03-hot-reload-x10.json`
+
+Ten `SIGHUP`s at 1.5s spacing under sustained load. Target: zero dropped
+connections.
+
+- **Headline:** `background_requests_failed` out of
+  `background_requests_total` (k6, ~8-14k rps), and
+  `probe_failures_during_reload_window`.
+- **Asserts:** every signal applied, the config generation advanced once
+  per reload, and zero drops in both streams.
+- Reload application is confirmed from manifold's **structured log**
+  (`config reloaded` records and the `generation` field), so a signal
+  that was delivered but silently ignored fails the run instead of
+  scoring a free zero.
+- **A real manifold defect, found by this scenario and since fixed:**
+  after the first successful reload, `GET :9090/metrics` returned **HTTP
+  500 permanently**. Each reload registered the new generation's
+  scrape-time collectors (`manifold_upstream_inflight`,
+  `manifold_upstream_available`, `manifold_breaker_state`) without
+  unregistering the retired generation's, so two pools emitted identical
+  series and the gatherer rejected the entire exposition
+  (`collected metric ... was collected before with the same name and
+  label values`). The data plane and `:9090/healthz` stayed healthy
+  throughout — a pure observability outage, permanent until restart, and
+  triggered by nothing more than an operator editing the config.
+
+  `proxy.Server.Close` now unregisters what `New` registered, and
+  `TestMetrics_SurviveGenerationTurnover` builds eleven generations
+  against one registry and scrapes after each retirement. Verified
+  end-to-end: 200 before, 200 after ten reloads, exactly three
+  `manifold_upstream_inflight` series rather than thirty.
+
+  Worth stating plainly because it is the argument for this whole suite:
+  every Go test passed, CI was green, and the reload gate reported zero
+  dropped connections. No unit test had ever built two generations
+  against one registry, so nothing caught it until something actually
+  ran the binary and scraped it.
+
+  The JSON still records `metrics_endpoint_status_before/after_reload` as
+  a regression guard. Reload application is confirmed from manifold's
+  structured log regardless, which is the more direct signal.
+
+### 4. Latency spike to 2000ms — `04-latency-spike-breaker.json`
+
+Drives backend 9001's latency from 1ms to 2000ms through its control
+port and measures the breaker.
+
+- **Headline:** `time_to_breaker_open_s` — injection until
+  `manifold_breaker_state` for 9001 reads >= 1.
+- **Asserts:** the breaker opens within 10s, a `to="open"` transition is
+  recorded, and the client-visible failure rate stays at or below 1%.
+- **Expect** roughly 0.5-0.7s (five 500ms timeouts at
+  `failure_threshold: 5`).
+
+**This scenario runs a modified config, and has to.** Two overrides,
+both recorded in the output JSON:
+
+1. `transport.response_header_timeout` is dropped from the shipped 10s to
+   `500ms` (`S4_RESPONSE_HEADER_TIMEOUT`). A 2000ms response is well
+   inside 10s, so with the stock config the spike produces slow
+   *successes* and not a single failure — and the breaker only counts
+   transport errors and 5xx. The breaker correctly stays closed forever
+   and the scenario measures nothing. Lowering the timeout is what makes
+   the injected latency a genuine failure.
+2. Passive health is **disabled**. Left on, the same timeouts feed both
+   the breaker and the passive tracker, and whichever ejects first
+   starves the other of traffic — the measurement becomes a race, not a
+   breaker. Passive ejection is exercised in scenarios 1 and 2.
+
+`post_spike_shed_rate` is the **client-visible** failure rate, and
+near-zero is the correct answer, not a miss: two healthy peers plus
+retry mean nothing is refused at the edge. The proof the breaker did
+something is `upstream_requests_to_spiked_backend_after_open`, which
+drops to a handful of half-open probes.
+
+### 5. All backends down — `05-all-backends-down.json`
+
+Kills all three backends and issues one wall-clock-timed request with a
+hard 30s client cap.
+
+- **Headline:** `time_to_first_error_s` and `http_status`.
+- **Asserts:** responds in under `FAIL_FAST_THRESHOLD_S` (5s) with 502 or
+  503 rather than hanging.
+- **Both statuses are correct and mean different things.** 502 is
+  "manifold tried the backends and the connections were refused" — the
+  window between the kill and ejection. 503 is "the pool has no eligible
+  backend", i.e. ejection already happened. A hang, a 200, or a
+  client-side timeout (`000`) is the failure.
+- **Expect** ~20ms.
 
 ## Reproducing end to end
 
@@ -434,6 +621,25 @@ All of this runs **inside WSL2 Ubuntu**, not on the Windows host directly
 
    ```bash
    ./bench/scripts/run-failure-scenarios.sh
+   echo $?
+   ```
+
+   The exit code is meaningful and distinguishes the two ways a run can
+   go wrong:
+
+   | code | meaning |
+   |------|---------|
+   | `0`  | every assertion passed |
+   | `2`  | the harness ran fine, but manifold missed at least one target |
+   | `1`  | the harness itself broke (missing tool or binary, a service that never came up) |
+
+   Read `summary.json` in the results directory for the per-assertion
+   verdicts; every scenario's own JSON also carries `assertion_passed`.
+
+   To run a subset:
+
+   ```bash
+   SCENARIOS="1 4" ./bench/scripts/run-failure-scenarios.sh
    ```
 
 Every script cleans up its own processes on exit, including on Ctrl-C
@@ -603,9 +809,11 @@ Two honest caveats on these two columns:
     cell specifically.
 - Failure-scenario output:
   `bench/results/<timestamp>-failure-scenarios/0N-<name>.json`, one file
-  per scenario. Each documents its own detection method inline (a
-  `method` field) because several of the signals (breaker-open timing,
-  readmission timing) are inferred from client-observable behavior rather
-  than a direct internal state read -- see the header comment in
-  `run-failure-scenarios.sh` for the specific assumptions made about
-  manifold's reload trigger and metric names.
+  per scenario, plus `summary.json` listing every assertion and its
+  verdict. Each scenario file documents its own detection method inline
+  in a `method` field, records `assertion` / `assertion_passed`, and --
+  where a number genuinely could not be taken -- emits `null` alongside a
+  `*_reason` field saying why. A bare `null` with no reason is a bug in
+  the harness, not a result.
+
+  See "The five failure scenarios" below for what each one measures.

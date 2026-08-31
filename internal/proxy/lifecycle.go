@@ -87,6 +87,20 @@ func (s *Server) Close() {
 		t.Wait()
 	}
 
+	// Unregister this generation's scrape-time collectors before releasing the
+	// pools they read from. A hot reload builds a replacement Server whose
+	// pools register under the same names; if the retired generation stays
+	// registered, both emit manifold_upstream_inflight with identical labels
+	// and the registry rejects the whole exposition. /metrics then returns 500
+	// permanently from the first reload onward while the data plane stays
+	// perfectly healthy -- an observability outage that only appears in
+	// production, and only after someone changes the config.
+	if s.metrics != nil {
+		for _, c := range s.collectors {
+			s.metrics.UnregisterPoolCollector(c)
+		}
+	}
+
 	s.reg.Close()
 }
 

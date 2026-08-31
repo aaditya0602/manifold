@@ -73,6 +73,10 @@ func attemptFrom(ctx context.Context) *attemptState {
 // exercises routing, and the second Server built by a future hot reload must
 // all be able to exist without probing anybody's backends.
 type Server struct {
+	// metrics and collectors exist so Close can undo what New registered.
+	metrics    *observe.Metrics
+	collectors []observe.PoolStater
+
 	reg    *upstream.Registry
 	routes []route
 
@@ -185,6 +189,7 @@ func NewWithMetrics(cfg *config.Config, m *observe.Metrics) (*Server, error) {
 	s := &Server{
 		reg:      reg,
 		routes:   routes,
+		metrics:  m,
 		pools:    make(map[string]*poolInstr, len(cfg.Pools)),
 		probers:  make([]*health.Prober, 0, len(pools)),
 		trackers: make([]*health.Tracker, 0, len(pools)),
@@ -265,7 +270,12 @@ func NewWithMetrics(cfg *config.Config, m *observe.Metrics) (*Server, error) {
 			breakers: breakers,
 		}
 		s.pools[p.Name()] = pi
-		m.RegisterPoolCollector(poolStats{p: p, pi: pi})
+		// Kept so Close can unregister it. A retired generation whose pools
+		// stay registered is collected alongside the generation that replaced
+		// it, and identical series from both make every scrape fail.
+		st := poolStats{p: p, pi: pi}
+		s.collectors = append(s.collectors, st)
+		m.RegisterPoolCollector(st)
 	}
 	return s, nil
 }

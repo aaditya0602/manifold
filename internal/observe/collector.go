@@ -87,6 +87,30 @@ func (c *poolCollector) add(p PoolStater) {
 	c.mu.Unlock()
 }
 
+// remove drops a previously added pool.
+//
+// This is what makes hot reload survivable. Every reload builds a new
+// proxy.Server whose pools register here, and without a matching removal the
+// retired generation keeps being collected: two pools with the same name emit
+// manifold_upstream_inflight with identical labels, and a checked registry
+// rejects the *entire* exposition rather than just the duplicate. The symptom
+// is /metrics returning 500 permanently from the first reload onward, with the
+// data plane completely healthy -- a total observability outage precisely when
+// someone is most likely to be watching.
+func (c *poolCollector) remove(p PoolStater) {
+	if p == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, existing := range c.pools {
+		if existing == p {
+			c.pools = append(c.pools[:i], c.pools[i+1:]...)
+			return
+		}
+	}
+}
+
 // Describe sends both descriptors, making this a checked collector: the
 // registry will reject a Collect that emits anything else, which is what turns
 // a label typo into a failing scrape instead of a silently duplicated series.

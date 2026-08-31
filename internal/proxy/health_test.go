@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"github.com/aaditya0602/manifold/internal/observe"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -283,4 +285,48 @@ func TestMetrics_AvailabilityChanges(t *testing.T) {
 		map[string]string{"pool": "api", "upstream": broken.URL, "state": "available"}, 0)
 	wantSeries(t, fams, name,
 		map[string]string{"pool": "api", "upstream": live.URL, "state": "unavailable"}, 0)
+}
+
+// TestMetrics_SurviveGenerationTurnover reproduces what a hot reload does to
+// the metrics registry.
+//
+// Each reload builds a replacement Server whose pools register the same
+// scrape-time gauges under the same pool and upstream labels. Before the fix,
+// the retired generation was never unregistered, so both were collected and a
+// checked registry rejected the entire exposition: /metrics returned 500
+// permanently from the first reload onward while the data plane stayed
+// completely healthy. Found by running the failure-scenario suite, not by any
+// unit test, because no test had ever built two generations against one
+// registry.
+func TestMetrics_SurviveGenerationTurnover(t *testing.T) {
+	live := newBackend(t, nil)
+	m := observe.New("test")
+
+	scrapeOK := func(when string) {
+		t.Helper()
+		if _, err := m.Registry().Gather(); err != nil {
+			t.Fatalf("%s: gathering metrics failed: %v", when, err)
+		}
+	}
+
+	gen1, err := NewWithMetrics(simpleConfig(noRetry, live.URL), m)
+	if err != nil {
+		t.Fatalf("generation 1: %v", err)
+	}
+	scrapeOK("with one generation")
+
+	// Ten turnovers, matching the reload gate. Each retires the previous
+	// generation the way the supervisor does.
+	prev := gen1
+	for i := 2; i <= 11; i++ {
+		next, err := NewWithMetrics(simpleConfig(noRetry, live.URL), m)
+		if err != nil {
+			t.Fatalf("generation %d: %v", i, err)
+		}
+		prev.Close()
+		prev = next
+		scrapeOK(fmt.Sprintf("after retiring generation %d", i-1))
+	}
+	prev.Close()
+	scrapeOK("after retiring the last generation")
 }
