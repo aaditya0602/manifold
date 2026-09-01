@@ -1,0 +1,96 @@
+# manifold — demo configuration, used by `docker compose up` in this
+# directory. Trimmed from ../config.example.yaml, which remains the full
+# field reference; the trims and the shortened intervals below are called
+# out inline so nothing here has to be taken on faith.
+#
+# The three upstreams are compose service names (backend-fast, backend-slow,
+# backend-flaky), resolved over the compose network -- see
+# docker-compose.yml for what each one is configured to do.
+
+listen: ":8080"   # data plane: where client traffic lands
+admin:  ":9090"   # /metrics, /healthz, pprof -- never reachable from :8080
+
+server:
+  drain_timeout: 15s
+  trust_forwarded_for: false   # nothing in front of manifold in this demo
+
+pools:
+  - name: demo
+    strategy: round_robin
+
+    upstreams:
+      - url: http://backend-fast:9001
+        weight: 1
+      - url: http://backend-slow:9001
+        weight: 1
+      - url: http://backend-flaky:9001
+        weight: 1
+
+    health:
+      # Active probing. interval/thresholds are turned down hard from the
+      # config.example.yaml defaults (2s / 2 / 3) so that killing a backend
+      # with /_control/health?state=down becomes visible in about a second
+      # instead of several -- do not ship a 500ms probe interval to a real
+      # deployment, it triples steady-state probe traffic to every backend.
+      active:
+        enabled: true
+        path: /healthz
+        method: GET
+        interval: 500ms
+        timeout: 300ms
+        expect_status: []
+        healthy_threshold: 1     # one good probe readmits, for the same reason
+        unhealthy_threshold: 2
+
+      # Passive ejection over real traffic, for a backend that answers
+      # /healthz but fails the requests that matter. window/min_requests are
+      # shrunk to match a hand-run curl loop rather than the sustained load
+      # the config.example.yaml defaults (10s/20) assume.
+      passive:
+        enabled: true
+        window: 5s
+        min_requests: 5
+        error_rate: 0.5
+        eject_for: 10s
+
+    # Per-upstream circuit breaker. failure_threshold is low on purpose: the
+    # demo trips it by pushing backend-slow's /_control/latency past
+    # response_header_timeout (below) so requests to it start timing out --
+    # 3 consecutive timeouts to that one backend should open its breaker
+    # within a handful of requests.
+    breaker:
+      enabled: true
+      failure_threshold: 3
+      open_for: 5s
+      half_open_probes: 1
+
+    # Backpressure: past 32 concurrent requests to this pool, manifold sheds
+    # with 503 rather than queueing unbounded. Low because the three demo
+    # backends are single Go processes with no real capacity to protect --
+    # config.example.yaml's 1024 assumes real upstream capacity.
+    limits:
+      max_in_flight: 32
+      queue_timeout: 0s
+
+    retry:
+      max_attempts: 2
+      idempotent_only: true
+      per_try_timeout: 0s
+
+    transport:
+      max_idle_conns: 256
+      max_idle_conns_per_host: 64
+      max_conns_per_host: 0
+      idle_conn_timeout: 90s
+      dial_timeout: 2s
+      # Lowered from config.example.yaml's 10s specifically so the circuit
+      # breaker demo (step 4 in README.md) works on a laptop-sized backend
+      # latency: pushing backend-slow to 2s only trips the breaker if the
+      # transport gives up on it well before 2s.
+      response_header_timeout: 700ms
+      disable_compression: true
+
+routes:
+  - match:
+      path_prefix: /
+    pool: demo

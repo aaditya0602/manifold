@@ -8,6 +8,41 @@ An intake manifold splits one flow across many outlets. So does this.
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart LR
+    C[Clients] -->|HTTP/1.1| SUP
+
+    subgraph MANIFOLD["manifold process"]
+        direction TB
+        SUP["reload.Supervisor<br/>atomic.Pointer to the live generation"]
+        SUP --> LIM["limit<br/>bounded in-flight, sheds 503"]
+        LIM --> RT["proxy router<br/>first match wins on host/path/method/header"]
+        RT --> BAL["balance<br/>round-robin · least-conn · consistent hash"]
+        BAL --> BRK["breaker<br/>per upstream: closed / open / half-open"]
+        BRK --> RP["httputil.ReverseProxy<br/>pooled copy buffers, retry policy"]
+
+        HP["health.Prober<br/>active, own transport"] -.->|eligibility| POOL
+        HT["health.Tracker<br/>passive error window"] -.->|eligibility| POOL
+        POOL[("upstream.Pool<br/>availability + generation")]
+        POOL -.->|candidate set| BAL
+        RP -.->|per-attempt outcome| HT
+    end
+
+    RP -->|"pooled keep-alive"| B1["backend 1"]
+    RP --> B2["backend 2"]
+    RP --> B3["backend 3"]
+    HP -.->|"/healthz probes"| B1
+
+    ADMIN["admin listener :9090<br/>/metrics · /healthz · pprof"] -.-> MANIFOLD
+    OBS["observe<br/>Prometheus registry"] -.-> ADMIN
+```
+
+The data plane and the admin plane are separate listeners: `/metrics` and pprof are never reachable from whatever can reach the proxy, and admin traffic never lands in the benchmark numbers.
+
+Health checking never touches the request path. The prober and the passive tracker both write eligibility into `upstream.Pool`, which bumps a generation counter; the balancer receives an already-filtered candidate set and caches derived structures against that generation.
+
 ## What works today
 
 ```

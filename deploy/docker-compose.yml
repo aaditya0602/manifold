@@ -1,0 +1,103 @@
+# manifold demo topology.
+#
+# Host ports are overridable so the demo can coexist with whatever else is
+# already running -- a port collision on 8080 is the single most likely reason
+# this fails on someone else's machine, and "docker compose up" failing at the
+# last container is a poor first impression. Defaults are the documented ones:
+#
+#   MANIFOLD_PORT=18080 MANIFOLD_ADMIN_PORT=19090 PROMETHEUS_PORT=19091 #     docker compose -f deploy/docker-compose.yml up --build -d
+#
+# manifold demo topology.
+#
+#   backend-fast/-slow/-flaky  -- three chaos-controllable upstreams
+#   manifold                    -- data plane :8080, admin :9090
+#   prometheus                  -- scrapes manifold, UI on :9091
+#
+# Only 8080, 9090, and 9091 are published to the host. Backend data-plane
+# ports (9001 inside each container) are never published -- traffic reaches
+# them only through manifold, which is the point of the demo. Each backend's
+# admin/control port (9101 inside each container) IS published, one per
+# backend, because deploy/README.md's kill/latency/error-rate steps curl it
+# directly from the host.
+#
+# Run: docker compose up --build   (see deploy/README.md for the full walkthrough)
+
+services:
+  backend-fast:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["backend", "-addr", ":9001", "-admin", ":9101", "-id", "fast", "-latency", "1ms"]
+    ports:
+      - "${FAST_ADMIN_PORT:-9101}:9101"   # admin/control only; data plane stays internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9001/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  backend-slow:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["backend", "-addr", ":9001", "-admin", ":9101", "-id", "slow", "-latency", "50ms"]
+    ports:
+      - "${SLOW_ADMIN_PORT:-9102}:9101"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9001/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  backend-flaky:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["backend", "-addr", ":9001", "-admin", ":9101", "-id", "flaky", "-latency", "5ms", "-error-rate", "0.1"]
+    ports:
+      - "${FLAKY_ADMIN_PORT:-9103}:9101"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9001/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  manifold:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["manifold", "-config", "/etc/manifold/manifold.yaml", "-log-level", "info"]
+    volumes:
+      # Bind-mounted, not baked into the image, so the "edit the config and
+      # reload" step in README.md edits a file on the host and SIGHUP picks
+      # it up in the running container -- no rebuild.
+      - ./manifold.yaml:/etc/manifold/manifold.yaml:ro
+    ports:
+      - "${MANIFOLD_PORT:-8080}:8080"   # data plane
+      - "${MANIFOLD_ADMIN_PORT:-9090}:9090"   # admin: /metrics, /healthz
+    depends_on:
+      backend-fast:
+        condition: service_healthy
+      backend-slow:
+        condition: service_healthy
+      backend-flaky:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"   # host 9091 -> Prometheus' own default port in-container
+    depends_on:
+      manifold:
+        condition: service_healthy

@@ -1,0 +1,12 @@
+# Build context is the repo root (deploy/Dockerfile COPYs from here). None
+# of this is needed to build the manifold or backend binaries, and excluding
+# it keeps the context small and the build cache stable across doc-only edits.
+.git/
+bin/
+deploy/
+bench/results/
+bench/scripts/
+bench/nginx/
+*.md
+.github/
+.golangci.yml

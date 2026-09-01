@@ -1,7 +1,7 @@
 BIN := bin
 GO  ?= go
 
-.PHONY: all build test test-race vet lint fmt tidy clean run backend check
+.PHONY: all build test test-race vet lint fmt tidy clean run backend check demo demo-down
 
 all: vet test build
 
@@ -41,3 +41,11 @@ backend: build
 
 clean:
 	rm -rf $(BIN)
+
+# One-command demo: three chaos-controllable backends, manifold, Prometheus.
+# See deploy/README.md for the five-minute walkthrough.
+demo:
+	docker compose -f deploy/docker-compose.yml up --build -d
+
+demo-down:
+	docker compose -f deploy/docker-compose.yml down -v

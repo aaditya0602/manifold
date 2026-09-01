@@ -1,0 +1,10 @@
+# Prometheus config for the manifold demo. scrape_interval is turned down to
+# 2s (Prometheus' own default is 1m) purely so the graphs in the UI move
+# visibly during a few minutes of curl commands instead of sitting flat.
+global:
+  scrape_interval: 2s
+
+scrape_configs:
+  - job_name: manifold
+    static_configs:
+      - targets: ["manifold:9090"]
