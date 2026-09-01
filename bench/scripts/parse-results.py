@@ -282,19 +282,31 @@ def main(argv: list[str]) -> int:
     if thermally_compromised is True:
         drift_pct = drift.get("drift_pct") if drift else None
         threshold = drift.get("drift_threshold_pct") if drift else None
+        orig = drift.get("original_median_rps") if drift else None
+        recheck = drift.get("recheck_median_rps") if drift else None
+        # Direction matters and is not decoration. Slower at the end is the
+        # classic throttle. Faster at the end means the machine was still cold
+        # or power-starved when the first cell ran, so the baseline every other
+        # row is compared against is the depressed one -- a different fault
+        # with a different fix.
+        direction = ""
+        if orig and recheck:
+            direction = " (faster at the end)" if recheck > orig else " (slower at the end)"
         header_lines += [
             "> ## :warning: THERMALLY COMPROMISED",
             "> "
             + (
-                f"The first cell's median RPS drifted by **{drift_pct:.1f}%** between the "
-                f"start and end of this matrix run (threshold: {threshold:.0f}%)."
+                f"The first cell's median RPS drifted by **{drift_pct:.1f}%**{direction} "
+                f"between the start and end of this matrix run (threshold: {threshold:.0f}%)."
                 if drift_pct is not None and threshold is not None
                 else "The end-of-matrix drift check could not be computed cleanly and was "
                 "treated as compromised out of caution."
             ),
-            "> This run's numbers should be treated with suspicion -- the chassis most "
-            "likely throttled partway through. See `drift-check.json` in this results "
-            "directory, and consider re-running with a longer `COOLDOWN_SECS`.",
+            "> This run's numbers should be treated with suspicion. Slower at the end "
+            "means the chassis throttled partway through -- re-run with a longer "
+            "`COOLDOWN_SECS`. Faster at the end means it had not reached steady state "
+            "when the first cell ran, so the baseline is the depressed number -- re-run "
+            "with a longer `SETTLE_SECS`. See `drift-check.json` in this results directory.",
             "",
         ]
     elif thermally_compromised is False:

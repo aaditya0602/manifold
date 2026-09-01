@@ -69,6 +69,26 @@ require_built_binaries
 compute_core_groups
 check_ac_power
 
+# Let the machine reach thermal steady state before measuring anything.
+#
+# check_ac_power proves the laptop is plugged in. It does not prove the
+# chassis is ready. A machine that has just been running on battery, or that
+# was plugged in moments ago, starts with a depleted turbo/thermal budget and
+# runs measurably slow until it recovers -- and because the matrix measures
+# its first cell first, that depressed number becomes the baseline everything
+# else is compared against.
+#
+# This is not hypothetical. A run started immediately after plugging in
+# measured nginx at 9,665 rps in its first cell and 20,689 rps for the same
+# work later; the end-of-matrix drift check came back at 97% -- in the
+# *faster* direction, which is the signature of a cold start rather than
+# throttling. Set SETTLE_SECS=0 to skip, at your own risk.
+SETTLE_SECS="${SETTLE_SECS:-180}"
+if (( SETTLE_SECS > 0 )); then
+  log "settling for ${SETTLE_SECS}s so the chassis reaches steady state before the first measurement"
+  sleep "$SETTLE_SECS"
+fi
+
 LATENCIES=(${LATENCIES:-1ms 25ms})
 STRATEGIES=(${STRATEGIES:-round_robin least_conn consistent_hash})
 
