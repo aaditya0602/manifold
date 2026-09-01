@@ -4,7 +4,7 @@ An L7 HTTP load balancer in Go — path/header routing across upstream pools, wi
 
 An intake manifold splits one flow across many outlets. So does this.
 
-> **Status: Week 3 of 4.** The proxy serves real traffic across multiple upstreams with all three balancing strategies, active and passive health checking, per-upstream circuit breaking, bounded in-flight backpressure, hot config reload, and Prometheus metrics. Distributed tracing is not built yet, and the full benchmark matrix has not been run. The roadmap below marks exactly what exists and what does not, and this README will not claim otherwise before the code lands.
+> **Status: complete.** Everything below is built, tested, and measured. Distributed tracing is the one planned item deliberately not built — see the roadmap note. The benchmark numbers come from a committed run whose raw output is in this repository, and the limitations section says plainly what they do and do not establish.
 
 ---
 
@@ -82,8 +82,12 @@ X-Manifold-Upstream: http://127.0.0.1:9002
 | Week 3 | Circuit breaker, half-open probing | **done** |
 | Week 3 | Bounded in-flight, 503 shedding | **done** |
 | Week 3 | Hot config reload, zero dropped connections | **done** |
-| Week 3 | OpenTelemetry spans | not started |
-| Week 4 | Benchmark results + methodology | not started |
+| Week 3 | OpenTelemetry spans | **deferred, deliberately** |
+| Week 4 | Benchmark results + methodology | **done** |
+| Week 4 | One-command `docker compose` demo | **done** |
+| Week 4 | Close the throughput gap against nginx | **done** — see Performance |
+
+Distributed tracing was dropped on purpose rather than left undone. At the point the decision was live, manifold was 28% behind nginx at 2.2x its CPU per request, and OpenTelemetry span creation and context propagation would have added hot-path cost to a proxy already losing on CPU. Profiling and closing that gap was the better use of the remaining time, and the result is in the Performance section. Adding tracing later is straightforward — the request path already carries a per-attempt context — but claiming it now would be claiming something that is not here.
 
 ### Week 2 acceptance gate
 
@@ -113,6 +117,20 @@ The plan's gate was *"10 consecutive config reloads at sustained load with **zer
 | Ten reloads completed in | 318 – 380 ms |
 
 Every response is counted, not sampled, and a body that fails to read to completion counts as a dropped connection even behind a `200` status line. Both the old and new backend sets are verified to have served traffic, so the test cannot pass by the swap silently not happening.
+
+## Try it in one command
+
+Requires Docker.
+
+```bash
+make demo
+```
+
+Three backends with deliberately different characteristics (1ms, 50ms, and one returning 10% errors), manifold, and Prometheus — chained by health checks so the stack comes up in order with no manual sequencing. [`deploy/README.md`](deploy/README.md) walks through watching traffic spread, taking a backend down and seeing it ejected and readmitted, tripping a circuit breaker, and hot-reloading the config, in about five minutes.
+
+Every step in that walkthrough was executed against the running stack, not written from the source. Tear it down with `make demo-down`.
+
+If `8080` is already taken on your machine, every host port is overridable — see the note in `deploy/README.md`.
 
 ## Quickstart
 
