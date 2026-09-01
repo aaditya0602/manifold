@@ -1,0 +1,62 @@
+{
+  "timestamp_utc": "20260901T015349Z",
+  "hostname": "AadityaPC",
+  "kernel": "Linux AadityaPC 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 GNU/Linux",
+  "nproc": 8,
+  "core_assignment": {
+    "k6": "0-1",
+    "lb": "2-3",
+    "backends": "4-7"
+  },
+  "go_version": "go version go1.27.0 linux/amd64",
+  "nginx_version": "nginx version: nginx/1.28.3 (Ubuntu)\nbuilt with OpenSSL 3.5.5 27 Jan 2026\nTLS SNI support enabled\nconfigure arguments: --with-cc-opt='-g -O2 -Werror=implicit-function-declaration -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -ffile-prefix-map=/build/nginx-OoBDy2/nginx-1.28.3=. -flto=auto -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fdebug-prefix-map=/build/nginx-OoBDy2/nginx-1.28.3=/usr/src/nginx-1.28.3-2ubuntu1.10 -fPIC -Wdate-time -D_FORTIFY_SOURCE=3' --with-ld-opt='-Wl,-Bsymbolic-functions -Wl,--package-metadata=%7B%22type%22:%22deb%22%2C%22os%22:%22ubuntu%22%2C%22name%22:%22nginx%22%2C%22version%22:%221.28.3-2ubuntu1.10%22%2C%22architecture%22:%22amd64%22%7D -flto=auto -ffat-lto-objects -Wl,-z,relro -Wl,-z,now -fPIC' --override-system=Linux --override-release=3.16.0 --override-machine=x86_64 --prefix=/usr/share/nginx --conf-path=/etc/nginx/nginx.conf --http-log-path=/var/log/nginx/access.log --error-log-path=stderr --lock-path=/var/lock/nginx.lock --pid-path=/run/nginx.pid --modules-path=/usr/lib/nginx/modules --http-client-body-temp-path=/var/lib/nginx/body --http-fastcgi-temp-path=/var/lib/nginx/fastcgi --http-proxy-temp-path=/var/lib/nginx/proxy --http-scgi-temp-path=/var/lib/nginx/scgi --http-uwsgi-temp-path=/var/lib/nginx/uwsgi --with-compat --with-debug --with-pcre-jit --with-http_ssl_module --with-http_stub_status_module --with-http_realip_module --with-http_auth_request_module --with-http_v2_module --with-http_v3_module --with-http_dav_module --with-http_slice_module --with-threads --build=Ubuntu --with-http_addition_module --with-http_flv_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_mp4_module --with-http_random_index_module --with-http_secure_link_module --with-http_sub_module --with-mail_ssl_module --with-stream_ssl_module --with-stream_ssl_preread_module --with-stream_realip_module --with-http_geoip_module=dynamic --with-http_image_filter_module=dynamic --with-http_perl_module=dynamic --with-http_xslt_module=dynamic --with-mail=dynamic --with-stream=dynamic --with-stream_geoip_module=dynamic",
+  "k6_version": "k6 v2.2.0 (commit/00a9a1b7f5, go1.26.5, linux/amd64)",
+  "git_commit": "8e0a6a7036ec63514d6cc2bdb8ddbbfd0da27952",
+  "git_working_tree": "clean",
+  "matrix": {
+    "concurrencies": [
+      "50",
+      "200",
+      "1000"
+    ],
+    "latencies": [
+      "1ms",
+      "25ms"
+    ],
+    "strategies": [
+      "round_robin",
+      "least_conn",
+      "consistent_hash"
+    ],
+    "targets": [
+      "manifold",
+      "nginx",
+      "direct"
+    ],
+    "runs_per_cell": 3,
+    "warmup_duration": "3s",
+    "measure_duration": "8s",
+    "cooldown_secs": 35,
+    "request_path": "/",
+    "include_c5000": false
+  },
+  "hardware_note": "Lenovo Yoga Slim 7 15ILL9, Intel Core Ultra 7 256V (4P+4E, no SMT), 16GB RAM, running under WSL2 -- see bench/README.md for the P/E-core and thermal caveats this implies.",
+  "thermally_compromised": false,
+  "drift_check": {
+    "original_files": [
+      "/home/aadi0602/manifold/bench/results/20260901T015349Z/manifold-round_robin-c50-l1ms-run1.json",
+      "/home/aadi0602/manifold/bench/results/20260901T015349Z/manifold-round_robin-c50-l1ms-run2.json",
+      "/home/aadi0602/manifold/bench/results/20260901T015349Z/manifold-round_robin-c50-l1ms-run3.json"
+    ],
+    "original_median_rps": 19426.78052105976,
+    "recheck_files": [
+      "/home/aadi0602/manifold/bench/results/20260901T015349Z/drift-check-run1.json",
+      "/home/aadi0602/manifold/bench/results/20260901T015349Z/drift-check-run2.json",
+      "/home/aadi0602/manifold/bench/results/20260901T015349Z/drift-check-run3.json"
+    ],
+    "recheck_median_rps": 18540.206966408885,
+    "drift_threshold_pct": 10.0,
+    "drift_pct": 4.563666911713855,
+    "thermally_compromised": false
+  }
+}

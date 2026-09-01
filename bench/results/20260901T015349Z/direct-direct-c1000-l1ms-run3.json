@@ -1,0 +1,31 @@
+{
+  "target": "direct",
+  "strategy": "direct",
+  "concurrency": 1000,
+  "backend_latency": "1ms",
+  "run": 3,
+  "scenario": "constant-vus",
+  "target_url": "http://127.0.0.1:9001",
+  "path": "/",
+  "duration": "8s",
+  "vus_param": 1000,
+  "rate_param": null,
+  "requests_total": 192864,
+  "requests_failed": 0,
+  "rps": 24029.95090569044,
+  "error_rate": 0,
+  "latency_ms": {
+    "p50": 32.738302000000004,
+    "p90": 78.08891740000001,
+    "p99": 112.87422041999999,
+    "p999": 147.113592352,
+    "avg": 40.628835574203,
+    "max": 182.827223
+  },
+  "thresholds_ok": true,
+  "lb_cpu_pct": null,
+  "lb_rss_kb_avg": null,
+  "lb_rss_kb_max": null,
+  "generated_at": "2026-09-01T02:47:23.078Z",
+  "k6_exit_code": 0
+}

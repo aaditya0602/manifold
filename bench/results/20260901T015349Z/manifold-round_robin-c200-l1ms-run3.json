@@ -1,0 +1,31 @@
+{
+  "target": "manifold",
+  "strategy": "round_robin",
+  "concurrency": 200,
+  "backend_latency": "1ms",
+  "run": 3,
+  "scenario": "constant-vus",
+  "target_url": "http://127.0.0.1:8080",
+  "path": "/",
+  "duration": "8s",
+  "vus_param": 200,
+  "rate_param": null,
+  "requests_total": 145671,
+  "requests_failed": 0,
+  "rps": 18196.74788200534,
+  "error_rate": 0,
+  "latency_ms": {
+    "p50": 8.538047,
+    "p90": 20.983967,
+    "p99": 39.524284899999984,
+    "p999": 66.80065779000033,
+    "avg": 10.895594694091676,
+    "max": 105.725531
+  },
+  "thresholds_ok": true,
+  "lb_cpu_pct": 143.32,
+  "lb_rss_kb_avg": 39275.0,
+  "lb_rss_kb_max": 40740.0,
+  "generated_at": "2026-09-01T02:23:51.656Z",
+  "k6_exit_code": 0
+}

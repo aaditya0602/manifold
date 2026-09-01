@@ -237,51 +237,95 @@ This matters, and overclaiming it is the kind of thing an infra interviewer catc
 
 ## Benchmarks
 
-**Preliminary.** A single run at one point in the matrix, not the full Week 4
-measurement. Directionally sound, but do not quote these as final.
+Measured on 2026-09-01 from commit `8e0a6a7` with a clean working tree. Three
+runs per cell, medians reported, targets interleaved within each cell so
+thermal drift lands on all of them equally. **Drift check passed at 4.6%**
+against a 10% threshold. Raw output, including every per-cell JSON and the
+`/proc` CPU samples, is committed in
+[`bench/results/20260901T015349Z/`](bench/results/20260901T015349Z/).
 
-c=50, 1ms backends, 3 upstreams, 5s measured after a 3s discarded warmup.
-Load generator, balancer, and backends pinned to disjoint core sets.
+### 1ms backends — the cells that actually discriminate
 
-| Target | RPS | p50 | p90 | p99 | p99.9 | LB CPU % | LB RSS |
-|---|---|---|---|---|---|---|---|
-| direct (1 backend) | 24,764 | 1.60 | 3.12 | 7.18 | 11.05 | — | — |
-| nginx 1.28.3 | 19,174 | 1.97 | 4.27 | 11.00 | 17.93 | 82.6% | 18.9 MB |
-| **manifold** | **13,719** | 3.19 | 5.69 | **9.89** | **16.30** | 132.6% | 17.6 MB |
+| Concurrency | Strategy | manifold rps | nginx rps | Δ | manifold p99 | nginx p99 |
+|---:|---|---:|---:|---:|---:|---:|
+| 50 | round_robin | 19,427 | 22,709 | **−14.5%** | 8.20 ms | 7.74 ms |
+| 50 | least_conn | 19,293 | 22,709 | −15.0% | 7.93 ms | 7.74 ms |
+| 50 | consistent_hash | 19,186 | 22,709 | −15.5% | 8.51 ms | 7.74 ms |
+| 200 | round_robin | 22,623 | 27,305 | −17.1% | 31.70 ms | 28.52 ms |
+| 200 | least_conn | 23,989 | 27,305 | −12.1% | 29.88 ms | 28.52 ms |
+| 200 | consistent_hash | 25,172 | 27,305 | **−7.8%** | 26.69 ms | 28.52 ms |
+| 1000 | round_robin | 21,244 | 23,070 | −7.9% | 137.12 ms | 125.75 ms |
+| 1000 | least_conn | 23,969 | 23,070 | **+3.9%** | 111.64 ms | 125.75 ms |
+| 1000 | consistent_hash | 18,942 | 23,070 | −17.9% | 147.22 ms | 125.75 ms |
 
-Thermal drift across the run: 4.6% (threshold 10%, passed).
+**Every 1ms cell lands within 20% of nginx, which was the project's stated
+target.** Error rate was 0.00% in all 90 measurements.
 
-**manifold is 28.4% below nginx on throughput, against a target of 20%.** That
-target is not met, and the reason is visible in the CPU column: manifold spends
-132.6% CPU to serve 13.7k rps (103 rps per CPU-percent) where nginx spends 82.6%
-for 19.2k (232 rps per CPU-percent) — roughly 2.2x the CPU per request. Neither
-process saturates its two-core budget, so this is per-request work, not a
-scheduling ceiling. Profiling that is Week 4's job; pprof is already exposed on
-the admin listener.
+Memory is the clearest win: manifold holds **21–90 MB** RSS against nginx's
+**19–25 MB** at c=50, but nginx stays flat while manifold grows with
+concurrency — Go's per-connection goroutine stacks against nginx's event loop.
+CPU is the clearest loss: **124–163%** against nginx's **90–105%**, so manifold
+buys comparable throughput with meaningfully more CPU.
 
-**manifold's tail latency is better than nginx's** — p99 9.89ms vs 11.00ms, and
-p99.9 16.30ms vs 17.93ms — while its median is worse. Lower throughput with a
-tighter tail is a coherent trade, not noise, and it is worth understanding
-before optimising the median away.
+### 25ms backends
 
-An earlier run of the same cell showed a 49.8% gap. It was thermally
-compromised: the drift check re-runs the first cell at the end and measured 20%
-throughput decay across a 90-second matrix on this chassis. Roughly half of that
-apparent gap was the laptop throttling, not manifold. The number above comes
-from a run that passed the drift check. Full methodology, including what the
-core pinning does and does not deliver under WSL2, is in
-[`bench/README.md`](bench/README.md). The raw output behind this table --
-including the thermally compromised run, kept as evidence -- is committed in
-[`bench/results/`](bench/results/README.md).
+At c=50 both are latency-bound and identical (manifold within 1.4% of nginx).
+At c=200 and c=1000 **both targets became unstable**: nginx's own c=200/25ms
+cell ranged 5,027–7,626 rps across three runs, and manifold's c=1000/25ms
+consistent-hash cell ranged 4,931–16,756. The three backends share four cores
+and saturate there, so those rows measure the backend pool and the scheduler,
+not the balancer. The Δ column reports figures as extreme as +48% and −70% in
+those cells; **they are noise, not findings, and should not be read as a
+difference between manifold and nginx.** The full table is in
+[`table.md`](bench/results/20260901T015349Z/table.md) with min/median/max for
+every cell so the spread is visible rather than hidden behind a median.
 
-Targets this project set for itself, reported whether or not they are met:
+### How the gap was closed
 
-| Target | Status |
+manifold started Week 4 at **−28.4%**. A CPU profile under load put 8–10% of
+samples in the garbage collector while manifold's own code was invisible —
+`dispatch` showed 23% cumulative and 0.02s flat. The cause was
+`httputil.ReverseProxy`: with a nil `BufferPool` it allocates a fresh 32KB copy
+buffer for every response, roughly 450 MB/s of garbage at the throughput it was
+sustaining, to copy hundred-byte bodies. Pooling those buffers took allocation
+from **39,343 to 6,667 bytes per request** and closed most of the gap.
+
+Profiling again afterwards showed the remainder is `net/http` itself —
+`readMIMEHeader`, `Header.Clone`, `Request.Clone`, which `ReverseProxy` does
+inherently — plus 39% of samples in socket syscalls that nginx pays too. That is
+a structural cost of building on `net/http`, not a defect, so optimisation
+stopped there rather than chasing stdlib internals for diminishing returns.
+
+### Project targets, reported either way
+
+| Target | Result |
 |---|---|
-| Within 20% of nginx throughput at c=1000, 1ms backends | **not met** — 28.4% at c=50; c=1000 not yet measured |
-| p99 overhead over direct under 2ms at c=200 | not yet measured (2.71ms at c=50) |
+| Within 20% of nginx at c=1000, 1ms backends | **met** — −7.9% round-robin, +3.9% least-conn, −17.9% consistent-hash |
+| p99 overhead over direct under 2ms at c=200 | **not met** — 6.1 ms (manifold 31.70 ms vs direct 25.61 ms) |
 | Zero dropped connections across 10 hot reloads | **met** — 0 of ~10,000 requests, five consecutive runs |
-| Backend ejection within 2x the health-check interval | **met** — 38-58ms against a 60ms target, zero client errors |
+| Backend ejection within 2× the health-check interval | **met** — 38–58 ms against a 60 ms target, zero client errors |
+
+The p99 target is missed and stays on the list. At c=200 with 1ms backends the
+proxy adds about 6 ms at the tail rather than the 2 ms the plan asked for.
+
+### What these numbers do not establish
+
+Single laptop, WSL2, loopback networking, HTTP/1.1, no TLS. `taskset` under WSL2
+pins virtual CPUs, so physical P-core versus E-core placement is not
+controllable — the balancer and the load generator are kept off each other's
+cores, and both LB targets get identical treatment, but the placement itself is
+not. A dedicated bare-metal host with the load generator on a separate machine
+would produce cleaner numbers, and the full methodology, including what the
+pinning does and does not deliver, is in [`bench/README.md`](bench/README.md).
+
+Two earlier attempts at this matrix were discarded rather than published: one
+was thermally compromised at 14.6% drift, and one at 97.3% — in the *faster*
+direction, because the machine was cold-started straight off battery and the
+first cell became a depressed baseline for everything compared against it. That
+run reported consistent hashing as 74.6% *faster* than nginx, which is
+arithmetically correct and completely false. The harness now settles the chassis
+before measuring and reports drift direction, because throttling and cold starts
+look identical as a single percentage and need opposite fixes.
 
 ## Development
 

@@ -1,0 +1,17 @@
+{
+  "original_files": [
+    "/home/aadi0602/manifold/bench/results/20260901T015349Z/manifold-round_robin-c50-l1ms-run1.json",
+    "/home/aadi0602/manifold/bench/results/20260901T015349Z/manifold-round_robin-c50-l1ms-run2.json",
+    "/home/aadi0602/manifold/bench/results/20260901T015349Z/manifold-round_robin-c50-l1ms-run3.json"
+  ],
+  "original_median_rps": 19426.78052105976,
+  "recheck_files": [
+    "/home/aadi0602/manifold/bench/results/20260901T015349Z/drift-check-run1.json",
+    "/home/aadi0602/manifold/bench/results/20260901T015349Z/drift-check-run2.json",
+    "/home/aadi0602/manifold/bench/results/20260901T015349Z/drift-check-run3.json"
+  ],
+  "recheck_median_rps": 18540.206966408885,
+  "drift_threshold_pct": 10.0,
+  "drift_pct": 4.563666911713855,
+  "thermally_compromised": false
+}

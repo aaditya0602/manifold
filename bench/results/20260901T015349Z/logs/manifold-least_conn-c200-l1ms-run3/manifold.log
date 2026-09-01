@@ -1,0 +1,3 @@
+{"time":"2026-08-31T22:26:53.870139852-04:00","level":"INFO","msg":"manifold started","version":"manifold 8e0a6a7036ec (go1.27.0)","listen":":8080","admin":":9090","pools":1,"routes":1,"watch":false}
+{"time":"2026-08-31T22:27:05.403659454-04:00","level":"INFO","msg":"draining","timeout":15000000000}
+{"time":"2026-08-31T22:27:05.403774909-04:00","level":"INFO","msg":"drained cleanly","after":89943}

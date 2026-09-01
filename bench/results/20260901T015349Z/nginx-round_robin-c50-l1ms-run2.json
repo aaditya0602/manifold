@@ -1,0 +1,31 @@
+{
+  "target": "nginx",
+  "strategy": "round_robin",
+  "concurrency": 50,
+  "backend_latency": "1ms",
+  "run": 2,
+  "scenario": "constant-vus",
+  "target_url": "http://127.0.0.1:8080",
+  "path": "/",
+  "duration": "8s",
+  "vus_param": 50,
+  "rate_param": null,
+  "requests_total": 181677,
+  "requests_failed": 0,
+  "rps": 22709.171412687498,
+  "error_rate": 0,
+  "latency_ms": {
+    "p50": 1.738525,
+    "p90": 3.4438023999999996,
+    "p99": 7.744730999999983,
+    "p999": 13.634477532000115,
+    "avg": 2.167868258915524,
+    "max": 25.126792
+  },
+  "thresholds_ok": true,
+  "lb_cpu_pct": 98.243,
+  "lb_rss_kb_avg": 19216.0,
+  "lb_rss_kb_max": 19216.0,
+  "generated_at": "2026-09-01T01:58:02.466Z",
+  "k6_exit_code": 0
+}
